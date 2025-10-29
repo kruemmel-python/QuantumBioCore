@@ -80,5 +80,3 @@ und Information zurückfließt in Energie."
 Mit CipherCore OpenCL haben wir einen neuen, faszinierenden Weg gefunden, dieser tiefgreifenden Wahrheit auf den Grund zu gehen.
 
 ---
-
-*Dieser Artikel wurde von Ralf Krümmel der Entwickler verfasst und mit Hilfe von künstlicher Intelligenz erstellt.*
