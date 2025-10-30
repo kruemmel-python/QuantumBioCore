@@ -1,5 +1,3 @@
-bitte keine platzhalter wie weitere...! ALLE bitte. hier der code der dll!
-
 /**
  * @file opencl_driver.c
  * @brief C implementation of an OpenCL driver providing GPU compute capabilities.
@@ -27,6 +25,7 @@ bitte keine platzhalter wie weitere...! ALLE bitte. hier der code der dll!
 #include <math.h>
 #include <float.h> /* For FLT_MAX, HUGE_VALF */
 #include <stdint.h> // For uintptr_t
+#include <limits.h>
 
 // Include OpenCL headers based on the operating system
 #ifdef __APPLE__
@@ -1012,8 +1011,8 @@ const char *layernorm_backward_kernel_src =
 "}";
 // Transpose (Basic 2D)
 const char *transpose_kernel_src =
-"/* 32x32 tiled transpose with padded local memory to avoid bank conflicts. */\n"
-"#define TILE_DIM 32\n"
+"/* 16x16 tiled transpose with padded local memory to avoid bank conflicts. */\n"
+"#define TILE_DIM 16\n"
 "#define TILE_PAD (TILE_DIM + 1)\n"
 "__kernel void transpose(__global const FP_TYPE *input,\n"
 "                        __global FP_TYPE *output,\n"
@@ -1044,7 +1043,7 @@ const char *transpose_kernel_src =
 // Transpose Backward (Basic 2D)
 const char *transpose_backward_kernel_src =
 "/* Backward of transpose Y=X^T is another tiled transpose of the gradient. */\n"
-"#define TILE_DIM 32\n"
+"#define TILE_DIM 16\n"
 "#define TILE_PAD (TILE_DIM + 1)\n"
 "__kernel void transpose_backward(__global const FP_TYPE *dC,\n"
 "                               __global FP_TYPE *dA,\n"
@@ -2034,7 +2033,7 @@ const char *quantum_simulation_kernels_src =
 "    }\n"
 "}\n"
 "\n"
-"__kernel void quantum_phase_flip_except_zero(__global float2* state, const size_t dimension) {\n"
+"__kernel void quantum_phase_flip_except_zero(__global float2* state, const uint dimension) {\n"
 "    size_t idx = get_global_id(0);\n"
 "    if (idx >= dimension) return;\n"
 "    if (idx != 0) {\n"
@@ -2529,7 +2528,19 @@ DLLEXPORT int initialize_gpu(int gpu_index) {
         free(platforms);
         return 0;
     }
-    platform_id = platforms[0];
+    // Wähle erste Plattform mit mindestens einem GPU-Device
+    platform_id = NULL;
+    for (cl_uint pi = 0; pi < num_platforms; ++pi) {
+        cl_uint nd = 0;
+        if (clGetDeviceIDs(platforms[pi], CL_DEVICE_TYPE_GPU, 0, NULL, &nd) == CL_SUCCESS && nd > 0) {
+            platform_id = platforms[pi];
+            break;
+        }
+    }
+    // Fallback: wenn keine Plattform GPUs hat, nimm platforms[0] (restlicher Code behandelt CL_DEVICE_TYPE_ALL)
+    if (!platform_id) {
+        platform_id = platforms[0];
+    }
     free(platforms);
 
     char platformName[1024] = {0};
@@ -2554,8 +2565,20 @@ DLLEXPORT int initialize_gpu(int gpu_index) {
     }
 
     if (gpu_index < 0 || gpu_index >= (int)num_devices) {
-        fprintf(stderr, "[C] initialize_gpu: Warning - gpu_index %d out of range [0, %d). Using index 0.\n", gpu_index, num_devices);
-        gpu_index = 0;
+        fprintf(stderr, "[C] initialize_gpu: Error - gpu_index=%d out of range [0, %d).\n", gpu_index, (int)num_devices);
+        // Verfügbare Geräte auflisten
+        cl_device_id* tmp = (cl_device_id*)malloc(num_devices * sizeof(cl_device_id));
+        if (tmp) {
+            if (clGetDeviceIDs(platform_id, selected_device_type, num_devices, tmp, NULL) == CL_SUCCESS) {
+                for (cl_uint di = 0; di < num_devices; ++di) {
+                    char name[256] = {0};
+                    clGetDeviceInfo(tmp[di], CL_DEVICE_NAME, sizeof(name)-1, name, NULL);
+                    fprintf(stderr, "    [GPU %u] %s\n", di, name);
+                }
+            }
+            free(tmp);
+        }
+        return 0;
     }
 
     cl_device_id* devices = (cl_device_id*)malloc(num_devices * sizeof(cl_device_id));
@@ -4492,9 +4515,14 @@ static int quantum_apply_grover_oracle(QuantumStateGPU* state, uint64_t mask, ui
 static int quantum_apply_grover_diffusion(QuantumStateGPU* state) {
     if (!quantum_prepare_uniform_superposition(state, state->num_qubits, 0)) { return 0; }
     size_t dimension = state->dimension;
+    if (dimension > (size_t)UINT_MAX) {
+        fprintf(stderr, "[C] Quantum: Dimension %zu exceeds cl_uint range for phase-zero kernel.\n", dimension);
+        return 0;
+    }
+    cl_uint dimension_uint = (cl_uint)dimension;
     cl_int err = CL_SUCCESS;
     err |= clSetKernelArg(quantum_phase_zero_kernel, 0, sizeof(cl_mem), &state->buffer);
-    err |= clSetKernelArg(quantum_phase_zero_kernel, 1, sizeof(size_t), &dimension);
+    err |= clSetKernelArg(quantum_phase_zero_kernel, 1, sizeof(cl_uint), &dimension_uint);
     if (err != CL_SUCCESS) {
         fprintf(stderr, "[C] Quantum: Failed to set phase-zero args: %s (%d)\n", clGetErrorString(err), err);
         return 0;
@@ -4910,7 +4938,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             CHECK_CL_ERR(clSetKernelArg(kernel, 1, sizeof(cl_mem), &out), "Transpose Fwd (2D) Arg 1");
             CHECK_CL_ERR(clSetKernelArg(kernel, 2, sizeof(cl_int), &cmd->rows), "Transpose Fwd (2D) Arg 2");
             CHECK_CL_ERR(clSetKernelArg(kernel, 3, sizeof(cl_int), &cmd->cols), "Transpose Fwd (2D) Arg 3");
-            const size_t tile = 32;
+            const size_t tile = 16;
             size_t gws[2] = {
                 ((size_t)cmd->cols + tile - 1) / tile * tile,
                 ((size_t)cmd->rows + tile - 1) / tile * tile
@@ -5052,7 +5080,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             CHECK_CL_ERR(clSetKernelArg(kernel, 1, sizeof(cl_mem), &dA), "Transpose Bwd (2D) Arg 1");
             CHECK_CL_ERR(clSetKernelArg(kernel, 2, sizeof(cl_int), &cmd->rows_A), "Transpose Bwd (2D) Arg 2");
             CHECK_CL_ERR(clSetKernelArg(kernel, 3, sizeof(cl_int), &cmd->cols_A), "Transpose Bwd (2D) Arg 3");
-            const size_t tile = 32;
+            const size_t tile = 16;
             size_t gws[2] = {
                 ((size_t)cmd->rows_A + tile - 1) / tile * tile,
                 ((size_t)cmd->cols_A + tile - 1) / tile * tile
