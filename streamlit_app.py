@@ -1,19 +1,345 @@
 # streamlit_app.py
 # QuantumBioCore – GPU Demo Studio
-# Python 3.12, nutzt deinen CipherCore OpenCL-Treiber über quantumbiocore_gpu.CipherCoreGPU
+# Python 3.12, nutzt deinen CipherCore OpenCL-Treiber über einen eingebauten ctypes-Wrapper (dll_wrapper.core)
 # Fokus: Klarheit, Einfachheit, Lesbarkeit • Explizite Fehlerpfade (PEP 634), Typhinweise, docstrings
 
 from __future__ import annotations
 
 import contextlib
+import time
+from ctypes import byref, c_int, c_size_t, c_void_p
 from dataclasses import dataclass
-from typing import Any, Final, Literal
+from typing import Any, Final, Iterable
 
 import numpy as np
 import streamlit as st
 
-# Dein High-Level-Wrapper (muss im gleichen Ordner liegen)
-from quantumbiocore_gpu import CipherCoreGPU, QBCError, _as_f32
+from dll_wrapper import FLOAT_C_TYPE, UInt64, core
+
+
+class QBCError(RuntimeError):
+    """Wrapper-spezifischer Fehler, wird bei Treibermeldungen ausgelöst."""
+
+
+def _as_f32(data: np.ndarray | Iterable[float]) -> np.ndarray:
+    """Konvertiert Eingaben in einen zusammenhängenden float32-Array."""
+
+    return np.ascontiguousarray(np.array(data, dtype=np.float32, copy=False))
+
+
+class CipherCoreGPU:
+    """Leichtgewichtiger Python-Wrapper um die wichtigsten DLL-Aufrufe."""
+
+    def __init__(self, gpu_index: int):
+        self.gpu_index: int = int(gpu_index)
+        self._alive: bool = False
+        status = core.initialize_gpu(c_int(self.gpu_index))
+        if status == 0:
+            raise QBCError(f"initialize_gpu({self.gpu_index}) fehlgeschlagen")
+        self._alive = True
+
+    # --------------------------------------------------
+    # Hilfsfunktionen für Speicher und Transfers
+    # --------------------------------------------------
+    def _check(self, ok: int, where: str) -> None:
+        if ok == 0:
+            raise QBCError(f"{where} fehlgeschlagen")
+
+    def _alloc(self, nbytes: int) -> Any:
+        handle = core.allocate_gpu_memory(c_int(self.gpu_index), c_size_t(nbytes))
+        if not handle:
+            raise QBCError(f"allocate_gpu_memory({nbytes} bytes) fehlgeschlagen")
+        return handle
+
+    def _free(self, handle: Any) -> None:
+        if handle:
+            core.free_gpu_memory(c_int(self.gpu_index), handle)
+
+    def _upload(self, array: np.ndarray) -> Any:
+        buf = self._alloc(array.nbytes)
+        try:
+            host_ptr = c_void_p(array.ctypes.data)
+            self._check(
+                core.write_host_to_gpu_blocking(
+                    c_int(self.gpu_index), buf, c_size_t(0), c_size_t(array.nbytes), host_ptr
+                ),
+                "write_host_to_gpu_blocking",
+            )
+            return buf
+        except Exception:
+            self._free(buf)
+            raise
+
+    def _download_into(self, buf: Any, out: np.ndarray) -> np.ndarray:
+        host_ptr = c_void_p(out.ctypes.data)
+        self._check(
+            core.read_gpu_to_host_blocking(
+                c_int(self.gpu_index), buf, c_size_t(0), c_size_t(out.nbytes), host_ptr
+            ),
+            "read_gpu_to_host_blocking",
+        )
+        return out
+
+    # --------------------------------------------------
+    # Öffentlich genutzte Operationen
+    # --------------------------------------------------
+    def set_deterministic(self, enabled: bool, seed: int) -> None:
+        core.subqg_set_deterministic_mode(c_int(1 if enabled else 0), UInt64(seed))
+
+    def shutdown(self) -> None:
+        if not self._alive:
+            return
+        with contextlib.suppress(Exception):
+            core.subqg_release_state(c_int(self.gpu_index))
+            core.finish_gpu(c_int(self.gpu_index))
+        core.shutdown_gpu(c_int(self.gpu_index))
+        self._alive = False
+
+    # Mathematische Bausteine --------------------------------------------
+    def matmul(self, A: np.ndarray, B: np.ndarray) -> np.ndarray:
+        a = _as_f32(A)
+        b = _as_f32(B)
+        if a.shape[1] != b.shape[0]:
+            raise ValueError("Matrix-Multiplikation verlangt kompatible Dimensionen")
+        M, K = a.shape
+        _, N = b.shape
+        out = np.empty((M, N), dtype=np.float32)
+        a_buf = self._upload(a)
+        b_buf = self._upload(b)
+        c_buf = self._alloc(out.nbytes)
+        try:
+            self._check(
+                core.execute_matmul_on_gpu(
+                    c_int(self.gpu_index), a_buf, b_buf, c_buf, c_int(1), c_int(M), c_int(N), c_int(K)
+                ),
+                "execute_matmul_on_gpu",
+            )
+            result = self._download_into(c_buf, out)
+        finally:
+            self._free(a_buf)
+            self._free(b_buf)
+            self._free(c_buf)
+        return result
+
+    def softmax(self, X: np.ndarray) -> np.ndarray:
+        data = _as_f32(X)
+        rows, cols = data.shape
+        out = np.empty_like(data)
+        in_buf = self._upload(data)
+        out_buf = self._alloc(out.nbytes)
+        try:
+            self._check(
+                core.execute_softmax_on_gpu(
+                    c_int(self.gpu_index), in_buf, out_buf, c_int(rows), c_int(cols)
+                ),
+                "execute_softmax_on_gpu",
+            )
+            result = self._download_into(out_buf, out)
+        finally:
+            self._free(in_buf)
+            self._free(out_buf)
+        return result
+
+    def log_softmax(self, X: np.ndarray) -> np.ndarray:
+        data = _as_f32(X)
+        rows, cols = data.shape
+        out = np.empty_like(data)
+        in_buf = self._upload(data)
+        out_buf = self._alloc(out.nbytes)
+        try:
+            self._check(
+                core.execute_log_softmax_stable_gpu(
+                    c_int(self.gpu_index), in_buf, out_buf, c_int(rows), c_int(cols)
+                ),
+                "execute_log_softmax_stable_gpu",
+            )
+            result = self._download_into(out_buf, out)
+        finally:
+            self._free(in_buf)
+            self._free(out_buf)
+        return result
+
+    def cross_entropy_grad(
+        self,
+        log_probs: np.ndarray,
+        targets: np.ndarray,
+        class_weights: np.ndarray | None = None,
+    ) -> np.ndarray:
+        lp = _as_f32(log_probs)
+        tgt = np.ascontiguousarray(targets.astype(np.int32, copy=False))
+        if lp.shape[0] != tgt.shape[0]:
+            raise ValueError("targets muss dieselbe Batchdimension wie log_probs besitzen")
+        rows, cols = lp.shape
+        grad = np.empty_like(lp)
+        losses = np.empty((rows,), dtype=np.float32)
+        lp_buf = self._upload(lp)
+        tgt_buf = self._upload(tgt)
+        grad_buf = self._alloc(grad.nbytes)
+        loss_buf = self._alloc(losses.nbytes)
+        try:
+            self._check(
+                core.execute_cross_entropy_loss_grad_gpu(
+                    c_int(self.gpu_index),
+                    lp_buf,
+                    tgt_buf,
+                    grad_buf,
+                    loss_buf,
+                    c_int(rows),
+                    c_int(cols),
+                ),
+                "execute_cross_entropy_loss_grad_gpu",
+            )
+            grad = self._download_into(grad_buf, grad)
+            losses = self._download_into(loss_buf, losses)
+        finally:
+            self._free(lp_buf)
+            self._free(tgt_buf)
+            self._free(grad_buf)
+            self._free(loss_buf)
+
+        if class_weights is not None:
+            cw = _as_f32(class_weights)
+            if cw.shape[0] != cols:
+                raise ValueError("class_weights benötigt Länge = Anzahl Klassen")
+            grad *= cw.reshape(1, -1)
+            losses *= cw[tgt]
+
+        return grad
+
+    def transpose(self, X: np.ndarray) -> np.ndarray:
+        data = _as_f32(X)
+        rows, cols = data.shape
+        out = np.empty((cols, rows), dtype=np.float32)
+        in_buf = self._upload(data)
+        out_buf = self._alloc(out.nbytes)
+        try:
+            self._check(
+                core.execute_transpose_on_gpu(
+                    c_int(self.gpu_index), in_buf, out_buf, c_int(rows), c_int(cols)
+                ),
+                "execute_transpose_on_gpu",
+            )
+            result = self._download_into(out_buf, out)
+        finally:
+            self._free(in_buf)
+            self._free(out_buf)
+        return result
+
+    def reduce_sum(self, X: np.ndarray, axis: int) -> np.ndarray:
+        data = _as_f32(X)
+        if data.ndim != 2:
+            raise ValueError("reduce_sum erwartet eine 2D-Matrix")
+        rows, cols = data.shape
+        if axis == 0:
+            reshaped = np.ascontiguousarray(data.reshape(rows, 1, cols))
+            B, M, N = rows, 1, cols
+            out = np.empty((cols,), dtype=np.float32)
+        elif axis == 1:
+            reshaped = np.ascontiguousarray(data.T.reshape(cols, 1, rows))
+            B, M, N = cols, 1, rows
+            out = np.empty((rows,), dtype=np.float32)
+        else:
+            raise ValueError("axis muss 0 oder 1 sein")
+
+        in_buf = self._upload(reshaped)
+        out_buf = self._alloc(out.nbytes)
+        try:
+            self._check(
+                core.execute_reduce_sum_gpu(
+                    c_int(self.gpu_index), in_buf, out_buf, c_int(B), c_int(M), c_int(N)
+                ),
+                "execute_reduce_sum_gpu",
+            )
+            result = self._download_into(out_buf, out)
+        finally:
+            self._free(in_buf)
+            self._free(out_buf)
+
+        return result
+
+    # Hebbian Update ------------------------------------------------------
+    def hebbian_update(
+        self,
+        W: np.ndarray,
+        pre: np.ndarray,
+        post: np.ndarray,
+        eta: float,
+        rows: int,
+        cols: int,
+    ) -> np.ndarray:
+        weight = _as_f32(W)
+        pre_vec = _as_f32(pre).reshape(1, 1, -1)
+        post_vec = _as_f32(post).reshape(1, 1, -1)
+        if pre_vec.shape[-1] != weight.shape[0] or post_vec.shape[-1] != weight.shape[1]:
+            raise ValueError("Hebbian: Dimensionen von pre/post passen nicht zu W")
+
+        w_buf = self._upload(weight)
+        a_buf = self._upload(pre_vec)
+        c_buf = self._upload(post_vec)
+        try:
+            self._check(
+                core.execute_hebbian_update_on_gpu(
+                    c_int(self.gpu_index),
+                    a_buf,
+                    c_buf,
+                    w_buf,
+                    FLOAT_C_TYPE(eta),
+                    c_int(1),
+                    c_int(1),
+                    c_int(cols),
+                    c_int(rows),
+                ),
+                "execute_hebbian_update_on_gpu",
+            )
+            result = self._download_into(w_buf, weight.copy())
+        finally:
+            self._free(a_buf)
+            self._free(c_buf)
+            self._free(w_buf)
+        return result
+
+    # SubQG ---------------------------------------------------------------
+    def subqg_initialize(self, x0: float, y0: float, delta: float, coupling: float) -> None:
+        self._check(
+            core.subqg_initialize_state(
+                c_int(self.gpu_index), FLOAT_C_TYPE(x0), FLOAT_C_TYPE(y0), FLOAT_C_TYPE(delta), FLOAT_C_TYPE(coupling)
+            ),
+            "subqg_initialize_state",
+        )
+
+    def subqg_step(self, alpha: float, beta: float, gamma: float) -> tuple[float, float, float, int, int, int]:
+        energy = FLOAT_C_TYPE()
+        phase = FLOAT_C_TYPE()
+        interf = FLOAT_C_TYPE()
+        node = c_int()
+        spin = c_int()
+        topo = c_int()
+        self._check(
+            core.subqg_simulation_step(
+                c_int(self.gpu_index),
+                FLOAT_C_TYPE(alpha),
+                FLOAT_C_TYPE(beta),
+                FLOAT_C_TYPE(gamma),
+                byref(energy),
+                byref(phase),
+                byref(interf),
+                byref(node),
+                byref(spin),
+                byref(topo),
+            ),
+            "subqg_simulation_step",
+        )
+        return (energy.value, phase.value, interf.value, node.value, spin.value, topo.value)
+
+    # Benchmark -----------------------------------------------------------
+    def bench(self, func, *args, warmup: int = 1, iters: int = 5) -> float:
+        for _ in range(max(0, warmup)):
+            func(*args)
+        start = time.perf_counter()
+        for _ in range(max(1, iters)):
+            func(*args)
+        end = time.perf_counter()
+        return (end - start) / max(1, iters)
 
 # ============================================================
 # 0) Hilfen: Stateful GPU-Instanz & Cleanup
@@ -77,7 +403,7 @@ except QBCError as e:
     st.stop()
 
 st.sidebar.markdown("---")
-st.sidebar.caption("Treiber: CipherCore_OpenCl.dll • High-Level: quantumbiocore_gpu.py")
+st.sidebar.caption("Treiber: CipherCore_OpenCl.dll • Wrapper: integrierte CipherCoreGPU-Klasse")
 
 # ============================================================
 # 2) Tabs
