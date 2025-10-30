@@ -4791,7 +4791,7 @@ static int ensure_quantum_kernels_ready(void) {
     if (!quantum_program || !quantum_single_qubit_kernel || !quantum_controlled_phase_kernel ||
         !quantum_controlled_not_kernel || !quantum_phase_oracle_kernel || !quantum_phase_zero_kernel ||
         !quantum_modexp_kernel || !quantum_swap_kernel || !quantum_probability_kernel ||
-        !quantum_expectation_pauli_z_kernel || !quantum_apply_gate_kernel) {
+        !quantum_expectation_pauli_z_kernel) {
         fprintf(stderr, "[C] Quantum: Kernels not compiled. Ensure initialize_gpu succeeded.\n");
         return 0;
     }
