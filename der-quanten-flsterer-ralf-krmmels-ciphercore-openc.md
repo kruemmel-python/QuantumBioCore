@@ -1,6 +1,7 @@
 # Das Flüstern der Quantenfelder: Ralf Krümmels OpenCL-Odyssee ins Herz des Bio-Computing
 
 Von: Ralf Krümmel der Entwickler
+<img width="1408" height="768" alt="opencl" src="https://github.com/user-attachments/assets/67ef3466-a78f-4bb3-be6e-fbf011bd3c43" />
 
 Tags: OpenCL, GPU-Computing, Quantenalgorithmen, Bio-Computing, Künstliche Intelligenz, Maschinelles Lernen, Hebbianisches Lernen, Prototyping, Rauschsteuerung, Streamlit, Python-Wrapper, C-Programmierung, Hochleistungsrechnen, Simulation
 
