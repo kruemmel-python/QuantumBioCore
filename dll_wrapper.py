@@ -39,6 +39,50 @@ PauliZTermPtr = POINTER(PauliZTerm)
 BufferHandle = c_void_p  # Für cl_mem Handles (void*)
 
 
+class KernelMetricsSample(Structure):
+    _fields_ = [
+        ("name", c_char * 64),
+        ("duration_ms", FLOAT_C_TYPE),
+        ("error", FLOAT_C_TYPE),
+        ("variance", FLOAT_C_TYPE),
+    ]
+
+
+class Complex2(Structure):
+    _fields_ = [("x", FLOAT_C_TYPE), ("y", FLOAT_C_TYPE)]
+
+
+ComplexMatrixRow = Complex2 * 8
+ComplexMatrix = ComplexMatrixRow * 8
+
+
+class QuantumGate(Structure):
+    _fields_ = [
+        ("name", c_char * 8),
+        ("arity", UInt32),
+        ("control", UInt32),
+        ("target", UInt32),
+        ("control2", UInt32),
+        ("params", FLOAT_C_TYPE * 4),
+        ("matrix", ComplexMatrix),
+    ]
+
+
+QuantumGatePtr = POINTER(QuantumGate)
+
+
+class HPIOAgent(Structure):
+    _fields_ = [
+        ("x", FLOAT_C_TYPE),
+        ("y", FLOAT_C_TYPE),
+        ("energy", FLOAT_C_TYPE),
+        ("coupling", FLOAT_C_TYPE),
+    ]
+
+
+HPIOAgentPtr = POINTER(HPIOAgent)
+
+
 # ---------------------------------------------------------------
 # 3. API Signaturen für alle exportierten Funktionen definieren
 # ---------------------------------------------------------------
@@ -56,6 +100,16 @@ core.subqg_set_deterministic_mode.argtypes = [c_int, UInt64]
 core.subqg_set_deterministic_mode.restype = None
 core.subqg_release_state.argtypes = [c_int]
 core.subqg_release_state.restype = None
+core.set_noise_level.argtypes = [c_int, FLOAT_C_TYPE]
+core.set_noise_level.restype = None
+core.get_noise_level.argtypes = [c_int]
+core.get_noise_level.restype = FLOAT_C_TYPE
+core.register_kernel_measurement_buffers.argtypes = [FloatPtr, FloatPtr]
+core.register_kernel_measurement_buffers.restype = None
+core.reset_kernel_measurement_buffers.argtypes = []
+core.reset_kernel_measurement_buffers.restype = None
+core.get_last_kernel_metrics.argtypes = [c_int, POINTER(KernelMetricsSample)]
+core.get_last_kernel_metrics.restype = c_int
 
 # --- B. Speicherverwaltung & Datentransfer ---
 core.allocate_gpu_memory.argtypes = [c_int, Size_t]
@@ -146,10 +200,18 @@ core.subqg_initialize_state.argtypes = [c_int, FLOAT_C_TYPE, FLOAT_C_TYPE, FLOAT
 core.subqg_initialize_state.restype = c_int
 core.subqg_initialize_state_batched.argtypes = [c_int, c_int, FloatPtr, FloatPtr, FLOAT_C_TYPE, FLOAT_C_TYPE]
 core.subqg_initialize_state_batched.restype = c_int
-core.subqg_simulation_step.argtypes = [c_int, FLOAT_C_TYPE, FLOAT_C_TYPE, FLOAT_C_TYPE, FloatPtr, FloatPtr, FloatPtr, IntPtr, IntPtr, IntPtr]
+core.subqg_simulation_step.argtypes = [c_int, FLOAT_C_TYPE, FLOAT_C_TYPE, FLOAT_C_TYPE,
+                                       FloatPtr, FloatPtr, FloatPtr,
+                                       IntPtr, IntPtr, IntPtr,
+                                       FloatPtr, c_int]
 core.subqg_simulation_step.restype = c_int
-core.subqg_simulation_step_batched.argtypes = [c_int, FloatPtr, FloatPtr, FloatPtr, c_int, FloatPtr, FloatPtr, FloatPtr, IntPtr, IntPtr, IntPtr]
+core.subqg_simulation_step_batched.argtypes = [c_int, FloatPtr, FloatPtr, FloatPtr, c_int,
+                                               FloatPtr, FloatPtr, FloatPtr,
+                                               IntPtr, IntPtr, IntPtr,
+                                               FloatPtr, c_int]
 core.subqg_simulation_step_batched.restype = c_int
+core.subqg_inject_agents.argtypes = [c_int, HPIOAgentPtr, c_int]
+core.subqg_inject_agents.restype = c_int
 
 # --- E. Quantenalgorithmen ---
 core.execute_shor_gpu.argtypes = [c_int, c_int, c_int, IntPtr, FloatPtr, c_int]
@@ -166,6 +228,12 @@ core.execute_qml_classifier_gpu.argtypes = [c_int, c_int, FloatPtr, c_int, Float
 core.execute_qml_classifier_gpu.restype = c_int
 core.execute_qec_cycle_gpu.argtypes = [c_int, c_int, UInt32, FloatPtr, c_int]
 core.execute_qec_cycle_gpu.restype = c_int
+core.quantum_upload_gate_sequence.argtypes = [c_int, QuantumGatePtr, c_int]
+core.quantum_upload_gate_sequence.restype = c_int
+core.quantum_apply_gate_sequence.argtypes = [c_int, c_int, FloatPtr, c_int]
+core.quantum_apply_gate_sequence.restype = c_int
+core.quantum_export_to_qasm.argtypes = [c_int, c_char_p]
+core.quantum_export_to_qasm.restype = c_int
 
 
 # ---------------------------------------------------------------
