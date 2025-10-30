@@ -241,6 +241,23 @@ cl_kernel quantum_probability_kernel = NULL;
 cl_kernel quantum_expectation_pauli_z_kernel = NULL;
 cl_kernel quantum_apply_gate_kernel = NULL;
 
+typedef struct {
+    char name[64];
+    float duration_ms;
+    float error;
+    float variance;
+} KernelMetricsSample;
+
+typedef struct {
+    char name[8];
+    cl_uint arity;
+    cl_uint control;
+    cl_uint target;
+    cl_uint control2;
+    float params[4];
+    cl_float2 matrix[8][8];
+} QuantumGate;
+
 // --- SubQG Simulation Buffers / State ---
 static cl_mem subqg_energy_buffer = NULL;
 static cl_mem subqg_phase_buffer = NULL;
@@ -451,6 +468,9 @@ static cl_int enqueue_kernel_with_metrics(cl_kernel kernel,
                                           const char* kernel_name,
                                           float* error_out,
                                           float* variance_out);
+
+#define ENQUEUE_KERNEL_PROFILED(kernel_handle, work_dim, global_ptr, local_ptr, kernel_label) \
+    enqueue_kernel_with_metrics(kernel_handle, work_dim, global_ptr, local_ptr, kernel_label, NULL, NULL)
 
 // Quantum helper declarations
 typedef struct {
@@ -4103,68 +4123,73 @@ DLLEXPORT int quantum_apply_gate_sequence(int gpu_index, int num_qubits, float* 
     }
 
     QuantumStateGPU state = {0};
+    cl_float2* host_state = NULL;
+    cl_mem probabilities = NULL;
+    float* host_probs = NULL;
+    cl_int err = CL_SUCCESS;
+    int success = 0;
+
     if (!quantum_allocate_state(num_qubits, &state)) {
-        return 0;
+        goto cleanup;
     }
 
-    cl_float2* host_state = (cl_float2*)calloc(state.dimension, sizeof(cl_float2));
+    host_state = (cl_float2*)calloc(state.dimension, sizeof(cl_float2));
     if (!host_state) {
         fprintf(stderr, "[C] Quantum: Failed to allocate host state buffer (%zu bytes).\n",
                 state.dimension * sizeof(cl_float2));
-        quantum_release_state(&state);
-        return 0;
+        goto cleanup;
     }
     host_state[0] = make_complex(1.0f, 0.0f);
 
-    int success = 0;
     for (size_t i = 0; i < quantum_gate_host_count; ++i) {
         if (!quantum_apply_gate_cpu(host_state, num_qubits, &quantum_gate_host_sequence[i])) {
             goto cleanup;
         }
     }
 
-    {
-        cl_int err = clEnqueueWriteBuffer(queue, state.buffer, CL_TRUE, 0,
-                                          state.dimension * sizeof(cl_float2), host_state, 0, NULL, NULL);
-        if (err != CL_SUCCESS) {
-            fprintf(stderr, "[C] Quantum: Failed to upload state after gate sequence: %s (%d)\n",
-                    clGetErrorString(err), err);
-            goto cleanup;
-        }
+    err = clEnqueueWriteBuffer(queue, state.buffer, CL_TRUE, 0,
+                                state.dimension * sizeof(cl_float2), host_state, 0, NULL, NULL);
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "[C] Quantum: Failed to upload state after gate sequence: %s (%d)\n",
+                clGetErrorString(err), err);
+        goto cleanup;
     }
 
-    cl_mem probabilities = NULL;
     if (!quantum_compute_probabilities_gpu(&state, &probabilities)) {
         goto cleanup;
     }
 
-    float* host_probs = (float*)malloc(dimension * sizeof(float));
+    host_probs = (float*)malloc(dimension * sizeof(float));
     if (!host_probs) {
         fprintf(stderr, "[C] Quantum: Failed to allocate host probability buffer (%zu bytes).\n",
                 dimension * sizeof(float));
-        clReleaseMemObject(probabilities);
         goto cleanup;
     }
 
-    cl_int err = clEnqueueReadBuffer(queue, probabilities, CL_TRUE, 0,
-                                     dimension * sizeof(float), host_probs, 0, NULL, NULL);
-    clReleaseMemObject(probabilities);
+    err = clEnqueueReadBuffer(queue, probabilities, CL_TRUE, 0,
+                              dimension * sizeof(float), host_probs, 0, NULL, NULL);
     if (err != CL_SUCCESS) {
         fprintf(stderr, "[C] Quantum: Failed to read probability buffer: %s (%d)\n",
                 clGetErrorString(err), err);
-        free(host_probs);
         goto cleanup;
     }
 
     if (out_probabilities) {
         memcpy(out_probabilities, host_probs, dimension * sizeof(float));
     }
-    free(host_probs);
     success = 1;
     quantum_gate_sequence_last_qubits = num_qubits;
 
 cleanup:
-    free(host_state);
+    if (probabilities) {
+        clReleaseMemObject(probabilities);
+    }
+    if (host_probs) {
+        free(host_probs);
+    }
+    if (host_state) {
+        free(host_state);
+    }
     quantum_release_state(&state);
     return success;
 }
@@ -4314,24 +4339,6 @@ typedef struct {
     float high_confidence_threshold;
 } ShapeLossRewardPenaltyListCommandData;
 
-typedef struct {
-    char name[64];
-    float duration_ms;
-    float error;
-    float variance;
-} KernelMetricsSample;
-
-typedef struct {
-    char name[8];
-    cl_uint arity;
-    cl_uint control;
-    cl_uint target;
-    cl_uint control2;
-    float params[4];
-    cl_float2 matrix[8][8];
-} QuantumGate;
-// ------------------------------------
-
 /**
  * @brief Zeros out a specified number of bytes in a GPU buffer.
  */
@@ -4471,9 +4478,6 @@ static cl_int enqueue_kernel_with_metrics(cl_kernel kernel,
 
     return CL_SUCCESS;
 }
-
-#define ENQUEUE_KERNEL_PROFILED(kernel_handle, work_dim, global_ptr, local_ptr, kernel_label) \
-    enqueue_kernel_with_metrics(kernel_handle, work_dim, global_ptr, local_ptr, kernel_label, NULL, NULL)
 
 static void release_subqg_resources(void) {
     if (!subqg_state_initialized) {
