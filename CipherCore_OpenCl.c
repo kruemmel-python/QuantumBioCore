@@ -34,6 +34,9 @@
 #include <CL/cl.h>
 #endif
 
+#include "CipherCore_NoiseCtrl.h"
+#include "SymBio_Interface.h"
+
 // --- Platform Specific Defines ---
 #ifndef M_PI
 /** @brief Definition of PI if not already defined. */
@@ -223,6 +226,7 @@ cl_kernel shape_loss_reward_penalty_list_kernel_fast = NULL; // NEU
 cl_program subqg_simulation_program = NULL;       cl_kernel subqg_simulation_kernel = NULL;
 cl_program subqg_simulation_program_fast = NULL;
 cl_kernel subqg_simulation_kernel_fast = NULL;
+cl_program subqg_agent_program = NULL;            cl_kernel subqg_agent_kernel = NULL;
 
 // Quantum Algorithm Kernels
 cl_program quantum_program = NULL;
@@ -235,6 +239,7 @@ cl_kernel quantum_modexp_kernel = NULL;
 cl_kernel quantum_swap_kernel = NULL;
 cl_kernel quantum_probability_kernel = NULL;
 cl_kernel quantum_expectation_pauli_z_kernel = NULL;
+cl_kernel quantum_apply_gate_kernel = NULL;
 
 // --- SubQG Simulation Buffers / State ---
 static cl_mem subqg_energy_buffer = NULL;
@@ -246,6 +251,9 @@ static cl_mem subqg_topology_buffer = NULL;
 static cl_mem subqg_rng_energy_buffer = NULL;
 static cl_mem subqg_rng_phase_buffer = NULL;
 static cl_mem subqg_rng_spin_buffer = NULL;
+static cl_mem subqg_field_map_buffer = NULL;
+static cl_mem subqg_agent_buffer = NULL;
+static size_t subqg_agent_buffer_bytes = 0;
 static float subqg_noise_level = 0.0f;
 static float subqg_threshold = 0.0f;
 static int subqg_cell_count = 0;
@@ -253,12 +261,24 @@ static int subqg_deterministic_mode = 0;
 static uint64_t subqg_rng_seed = 0;
 static uint64_t subqg_rng_state = 0;
 static int subqg_state_initialized = 0;
+static int subqg_field_map_elements = 0;
+static int subqg_grid_width = 0;
+static int subqg_grid_height = 0;
 
 // --- Quantum Simulation Scratch Buffers ---
 static cl_mem quantum_temp_state_buffer = NULL;
 static size_t quantum_temp_state_bytes = 0;
 static cl_mem quantum_probability_buffer = NULL;
 static size_t quantum_probability_bytes = 0;
+static cl_mem quantum_gate_sequence_buffer = NULL;
+static size_t quantum_gate_sequence_bytes = 0;
+static QuantumGate* quantum_gate_host_sequence = NULL;
+static size_t quantum_gate_host_count = 0;
+static int quantum_gate_sequence_last_qubits = 0;
+
+static KernelMetricsSample g_last_metrics = {"", 0.0f, 0.0f, 0.0f};
+static float* g_measurement_error_target = NULL;
+static float* g_measurement_variance_target = NULL;
 
 
 /**
@@ -352,20 +372,28 @@ DLLEXPORT int execute_proto_update_step_gpu(int gpu_index, void* prototypes, voi
 // Loss Shaping Exports
 DLLEXPORT int execute_shape_loss_with_reward_penalty_gpu(int gpu_index, void* loss_per_sample_in, void* predictions, void* targets, void* loss_per_sample_out, int num_samples, int num_classes, float penalty_weight, float reward_weight, float high_confidence_threshold, int critical_target_class, int critical_predicted_class);
 DLLEXPORT int execute_shape_loss_with_reward_penalty_list_gpu(int gpu_index, void* loss_per_sample_in, void* predictions, void* targets, void* loss_per_sample_out, void* critical_pairs, int num_samples, int num_classes, int num_critical_pairs, float penalty_weight, float reward_weight, float high_confidence_threshold); // NEU
+DLLEXPORT void set_noise_level(int gpu_index, float value);
+DLLEXPORT float get_noise_level(int gpu_index);
+DLLEXPORT void register_kernel_measurement_buffers(float* error_ptr, float* variance_ptr);
+DLLEXPORT void reset_kernel_measurement_buffers(void);
+DLLEXPORT int get_last_kernel_metrics(int gpu_index, KernelMetricsSample* out_metrics);
 DLLEXPORT int subqg_initialize_state(int gpu_index, float initial_energy, float initial_phase, float noise_level, float threshold);
 DLLEXPORT int subqg_initialize_state_batched(int gpu_index, int cell_count,
                                              const float* initial_energy, const float* initial_phase,
                                              float noise_level, float threshold);
 DLLEXPORT int subqg_simulation_step(int gpu_index, float rng_energy, float rng_phase, float rng_spin,
                                     float* out_energy, float* out_phase, float* out_interference,
-                                    int* out_node_flag, int* out_spin, int* out_topology);
+                                    int* out_node_flag, int* out_spin, int* out_topology,
+                                    float* out_field_map, int field_map_length);
 DLLEXPORT int subqg_simulation_step_batched(int gpu_index,
                                             const float* rng_energy, const float* rng_phase, const float* rng_spin,
                                             int batch_count,
                                             float* out_energy, float* out_phase, float* out_interference,
-                                            int* out_node_flag, int* out_spin, int* out_topology);
+                                            int* out_node_flag, int* out_spin, int* out_topology,
+                                            float* out_field_map, int field_map_length);
 DLLEXPORT void subqg_set_deterministic_mode(int enabled, uint64_t seed);
 DLLEXPORT void subqg_release_state(int gpu_index);
+DLLEXPORT int subqg_inject_agents(int gpu_index, const HPIOAgent* agents, int count);
 
 // Quantum algorithm support structures and exports
 typedef struct {
@@ -396,6 +424,9 @@ DLLEXPORT int execute_qml_classifier_gpu(int gpu_index, int num_qubits,
                                          float* out_expectations, int expectation_length);
 DLLEXPORT int execute_qec_cycle_gpu(int gpu_index, int code_type, uint32_t error_mask,
                                     float* out_syndrome, int syndrome_length);
+DLLEXPORT int quantum_upload_gate_sequence(int gpu_index, const QuantumGate* gates, int gate_count);
+DLLEXPORT int quantum_apply_gate_sequence(int gpu_index, int num_qubits, float* out_probabilities, int probability_length);
+DLLEXPORT int quantum_export_to_qasm(int gpu_index, const char* filepath);
 
 // --- Internal Helper Function Declarations ---
 cl_int compile_opencl_kernel_variant(const char* kernel_source, const char* kernel_name,
@@ -413,6 +444,13 @@ int zero_gpu_buffer(int gpu_index, void* gpu_buffer_handle, size_t size_bytes);
 static cl_int get_reduction_params_helper(size_t* lws_out, size_t* local_mem_bytes_out);
 static void release_subqg_resources(void);
 static void release_quantum_resources(void);
+static cl_int enqueue_kernel_with_metrics(cl_kernel kernel,
+                                          cl_uint work_dim,
+                                          const size_t* global_work_size,
+                                          const size_t* local_work_size,
+                                          const char* kernel_name,
+                                          float* error_out,
+                                          float* variance_out);
 
 // Quantum helper declarations
 typedef struct {
@@ -458,6 +496,7 @@ static int solve_linear_system(const float* matrix, const float* vector, int n, 
 static int quantum_initialize_basis_superposition(QuantumStateGPU* state, const uint32_t* basis_states, size_t count);
 static int quantum_prepare_steane_zero_state(QuantumStateGPU* state);
 static int quantum_measure_x_parity_gpu(QuantumStateGPU* state, const int* qubits, int count, float* out_value);
+static int quantum_apply_gate_cpu(cl_float2* state, int num_qubits, const QuantumGate* gate);
 
 
 // --- Kernel Source Code Strings ---
@@ -1925,7 +1964,10 @@ const char *subqg_simulation_kernel_src =
 "        __global const FP_TYPE* rng_spin,\n"
 "        FP_TYPE noise_level,\n"
 "        FP_TYPE threshold,\n"
-"        int cell_count)\n"
+"        FP_TYPE noise_factor,\n"
+"        int cell_count,\n"
+"        __global FP_TYPE* field_map,\n"
+"        int write_field_map)\n"
 "{\n"
 "    int idx = get_global_id(0);\n"
 "    if (idx >= cell_count) {\n"
@@ -1936,7 +1978,8 @@ const char *subqg_simulation_kernel_src =
 "    FP_TYPE rng_spin_val = rng_spin[idx];\n"
 "    FP_TYPE current_energy = energy[idx];\n"
 "    FP_TYPE current_phase = phase[idx];\n"
-"    FP_TYPE energy_delta = (rng_energy_val - (FP_TYPE)0.5f) * noise_level * (FP_TYPE)0.5f;\n"
+"    FP_TYPE effective_noise = noise_level * noise_factor;\n"
+"    FP_TYPE energy_delta = (rng_energy_val - (FP_TYPE)0.5f) * effective_noise * (FP_TYPE)0.5f;\n"
 "    FP_TYPE updated_energy = current_energy + energy_delta;\n"
 "    if (updated_energy > (FP_TYPE)1.0f) updated_energy = (FP_TYPE)1.0f;\n"
 "    if (updated_energy < (FP_TYPE)(-1.0f)) updated_energy = (FP_TYPE)(-1.0f);\n"
@@ -1944,7 +1987,7 @@ const char *subqg_simulation_kernel_src =
 "    if (clamped_phase > (FP_TYPE)1.0f) clamped_phase = (FP_TYPE)1.0f;\n"
 "    if (clamped_phase < (FP_TYPE)(-1.0f)) clamped_phase = (FP_TYPE)(-1.0f);\n"
 "    FP_TYPE phase_acc = asin(clamped_phase) / (FP_TYPE)M_PI;\n"
-"    phase_acc += (rng_phase_val - (FP_TYPE)0.5f) * noise_level * (FP_TYPE)0.2f;\n"
+"    phase_acc += (rng_phase_val - (FP_TYPE)0.5f) * effective_noise * (FP_TYPE)0.2f;\n"
 "    FP_TYPE updated_phase = sin(phase_acc * (FP_TYPE)M_PI);\n"
 "    FP_TYPE interference = (updated_energy + updated_phase) * (FP_TYPE)0.5f;\n"
 "    int node_flag = 0;\n"
@@ -1969,8 +2012,47 @@ const char *subqg_simulation_kernel_src =
 "    node_flag_out[idx] = node_flag;\n"
 "    spin_out[idx] = node_spin;\n"
 "    topology_out[idx] = topology;\n"
-"}";
+"    if (write_field_map) {\n"
+"        field_map[idx] = sin(updated_phase) * updated_energy;\n"
+"    }\n"
+"}\n";
 
+const char *subqg_agent_kernel_src =
+"typedef struct {\n"
+"    float x;\n"
+"    float y;\n"
+"    float energy;\n"
+"    float coupling;\n"
+"} HPIOAgent;\n"
+"__kernel void subqg_inject_agents(\n"
+"        __global FP_TYPE* energy,\n"
+"        __global FP_TYPE* phase,\n"
+"        __global FP_TYPE* field_map,\n"
+"        __global const HPIOAgent* agents,\n"
+"        const int agent_count,\n"
+"        const int grid_width,\n"
+"        const int grid_height)\n"
+"{\n"
+"    int idx = get_global_id(0);\n"
+"    int total = grid_width * grid_height;\n"
+"    if (idx >= total) {\n"
+"        return;\n"
+"    }\n"
+"    int x = idx % grid_width;\n"
+"    int y = idx / grid_width;\n"
+"    FP_TYPE local_energy = energy[idx];\n"
+"    for (int i = 0; i < agent_count; ++i) {\n"
+"        float dx = (float)x - agents[i].x;\n"
+"        float dy = (float)y - agents[i].y;\n"
+"        float dist = sqrt(dx * dx + dy * dy) + 1e-3f;\n"
+"        float influence = agents[i].coupling / dist;\n"
+"        local_energy += (FP_TYPE)(agents[i].energy * influence);\n"
+"    }\n"
+"    energy[idx] = local_energy;\n"
+"    if (field_map) {\n"
+"        field_map[idx] = sin(phase[idx]) * local_energy;\n"
+"    }\n"
+"}\n";
 const char *quantum_simulation_kernels_src =
 "inline float2 complex_add(float2 a, float2 b) { return (float2)(a.x + b.x, a.y + b.y); }\n"
 "inline float2 complex_sub(float2 a, float2 b) { return (float2)(a.x - b.x, a.y - b.y); }\n"
@@ -2356,6 +2438,7 @@ void shutdown_driver() {
     RELEASE_KERNEL(shape_loss_reward_penalty_list_kernel_fast); // NEU
     RELEASE_KERNEL(subqg_simulation_kernel);
     RELEASE_KERNEL(subqg_simulation_kernel_fast);
+    RELEASE_KERNEL(subqg_agent_kernel);
     RELEASE_KERNEL(quantum_single_qubit_kernel);
     RELEASE_KERNEL(quantum_controlled_phase_kernel);
     RELEASE_KERNEL(quantum_controlled_not_kernel);
@@ -2365,6 +2448,7 @@ void shutdown_driver() {
     RELEASE_KERNEL(quantum_swap_kernel);
     RELEASE_KERNEL(quantum_probability_kernel);
     RELEASE_KERNEL(quantum_expectation_pauli_z_kernel);
+    RELEASE_KERNEL(quantum_apply_gate_kernel);
     #undef RELEASE_KERNEL
     printf("[C] shutdown_driver: Kernels released.\n");
 
@@ -2444,6 +2528,7 @@ void shutdown_driver() {
     RELEASE_PROGRAM(shape_loss_reward_penalty_list_program_fast); // NEU
     RELEASE_PROGRAM(subqg_simulation_program);
     RELEASE_PROGRAM(subqg_simulation_program_fast);
+    RELEASE_PROGRAM(subqg_agent_program);
     RELEASE_PROGRAM(quantum_program);
     #undef RELEASE_PROGRAM
     printf("[C] shutdown_driver: Programs released.\n");
@@ -2755,6 +2840,15 @@ DLLEXPORT int initialize_gpu(int gpu_index) {
     COMPILE_KERNEL_DUAL(shape_loss_reward_penalty_list_kernel_src, "shape_loss_reward_penalty_list", shape_loss_reward_penalty_list);
     COMPILE_KERNEL_DUAL(subqg_simulation_kernel_src, "subqg_simulation_step", subqg_simulation);
     #undef COMPILE_KERNEL_DUAL
+    printf("[C] initialize_gpu: Compiling kernel 'subqg_inject_agents'...\n");
+    compile_err = compile_opencl_kernel_variant(subqg_agent_kernel_src, "subqg_inject_agents",
+                                                &subqg_agent_program, &subqg_agent_kernel, 0);
+    if (compile_err != CL_SUCCESS || !subqg_agent_kernel) {
+        fprintf(stderr, "[C] initialize_gpu: Failed to compile subqg agent kernel: %s (%d)\n",
+                clGetErrorString(compile_err), compile_err);
+        shutdown_driver();
+        return 0;
+    }
     printf("[C] initialize_gpu: Compiling kernel 'quantum_apply_single_qubit' (strict only)...\n");
     compile_err = compile_opencl_kernel_variant(quantum_simulation_kernels_src, "quantum_apply_single_qubit",
                                                 &quantum_program, &quantum_single_qubit_kernel, 0);
@@ -2932,6 +3026,10 @@ DLLEXPORT int subqg_initialize_state_batched(int gpu_index, int cell_count,
 
     release_subqg_resources();
 
+    subqg_grid_width = cell_count;
+    subqg_grid_height = 1;
+    subqg_field_map_elements = cell_count;
+
     cl_int err = CL_SUCCESS;
     const size_t fp_size = sizeof(FP_TYPE);
     const size_t int_size = sizeof(cl_int);
@@ -2959,9 +3057,10 @@ DLLEXPORT int subqg_initialize_state_batched(int gpu_index, int cell_count,
     subqg_rng_energy_buffer = clCreateBuffer(context, CL_MEM_READ_WRITE, fp_bytes, NULL, &err);
     subqg_rng_phase_buffer = clCreateBuffer(context, CL_MEM_READ_WRITE, fp_bytes, NULL, &err);
     subqg_rng_spin_buffer = clCreateBuffer(context, CL_MEM_READ_WRITE, fp_bytes, NULL, &err);
+    subqg_field_map_buffer = clCreateBuffer(context, CL_MEM_READ_WRITE, fp_bytes, NULL, &err);
 
     if (!subqg_interference_buffer || !subqg_node_flag_buffer || !subqg_spin_buffer || !subqg_topology_buffer ||
-        !subqg_rng_energy_buffer || !subqg_rng_phase_buffer || !subqg_rng_spin_buffer || err != CL_SUCCESS) {
+        !subqg_rng_energy_buffer || !subqg_rng_phase_buffer || !subqg_rng_spin_buffer || !subqg_field_map_buffer || err != CL_SUCCESS) {
         fprintf(stderr, "[C] subqg_initialize_state: Failed to allocate auxiliary buffers: %s (%d)\n", clGetErrorString(err), err);
         release_subqg_resources();
         return 0;
@@ -3016,6 +3115,9 @@ DLLEXPORT int subqg_initialize_state_batched(int gpu_index, int cell_count,
     if (err == CL_SUCCESS) {
         err = clEnqueueFillBuffer(queue, subqg_rng_spin_buffer, &zero_fp, fp_size, 0, fp_bytes, 0, NULL, NULL);
     }
+    if (err == CL_SUCCESS) {
+        err = clEnqueueFillBuffer(queue, subqg_field_map_buffer, &zero_fp, fp_size, 0, fp_bytes, 0, NULL, NULL);
+    }
     if (err != CL_SUCCESS) {
         fprintf(stderr, "[C] subqg_initialize_state_batched: Failed to initialize buffers: %s (%d)\n", clGetErrorString(err), err);
         release_subqg_resources();
@@ -3035,7 +3137,8 @@ DLLEXPORT int subqg_initialize_state_batched(int gpu_index, int cell_count,
 
 DLLEXPORT int subqg_simulation_step(int gpu_index, float rng_energy, float rng_phase, float rng_spin,
                                     float* out_energy, float* out_phase, float* out_interference,
-                                    int* out_node_flag, int* out_spin, int* out_topology) {
+                                    int* out_node_flag, int* out_spin, int* out_topology,
+                                    float* out_field_map, int field_map_length) {
     float energy_rng = rng_energy;
     float phase_rng = rng_phase;
     float spin_rng = rng_spin;
@@ -3046,6 +3149,16 @@ DLLEXPORT int subqg_simulation_step(int gpu_index, float rng_energy, float rng_p
     int spin_tmp = 0;
     int topo_tmp = -1;
 
+    float* field_map_tmp = NULL;
+    if (out_field_map && field_map_length > 0) {
+        field_map_tmp = (float*)malloc(sizeof(float) * (size_t)field_map_length);
+        if (!field_map_tmp) {
+            fprintf(stderr, "[C] subqg_simulation_step: Failed to allocate field_map staging buffer (%zu bytes).\n",
+                    sizeof(float) * (size_t)field_map_length);
+            return 0;
+        }
+    }
+
     int ok = subqg_simulation_step_batched(gpu_index,
                                            &energy_rng, &phase_rng, &spin_rng,
                                            1,
@@ -3054,7 +3167,8 @@ DLLEXPORT int subqg_simulation_step(int gpu_index, float rng_energy, float rng_p
                                            out_interference ? &interference_tmp : NULL,
                                            out_node_flag ? &node_tmp : NULL,
                                            out_spin ? &spin_tmp : NULL,
-                                           out_topology ? &topo_tmp : NULL);
+                                           out_topology ? &topo_tmp : NULL,
+                                           field_map_tmp, field_map_length);
 
     if (ok) {
         if (out_energy) { *out_energy = energy_tmp; }
@@ -3063,6 +3177,13 @@ DLLEXPORT int subqg_simulation_step(int gpu_index, float rng_energy, float rng_p
         if (out_node_flag) { *out_node_flag = node_tmp; }
         if (out_spin) { *out_spin = spin_tmp; }
         if (out_topology) { *out_topology = topo_tmp; }
+        if (out_field_map && field_map_tmp) {
+            memcpy(out_field_map, field_map_tmp, sizeof(float) * (size_t)field_map_length);
+        }
+    }
+
+    if (field_map_tmp) {
+        free(field_map_tmp);
     }
 
     return ok;
@@ -3072,7 +3193,8 @@ DLLEXPORT int subqg_simulation_step_batched(int gpu_index,
                                             const float* rng_energy, const float* rng_phase, const float* rng_spin,
                                             int batch_count,
                                             float* out_energy, float* out_phase, float* out_interference,
-                                            int* out_node_flag, int* out_spin, int* out_topology) {
+                                            int* out_node_flag, int* out_spin, int* out_topology,
+                                            float* out_field_map, int field_map_length) {
     (void)gpu_index;
     if (!subqg_state_initialized) {
         fprintf(stderr, "[C] subqg_simulation_step_batched: Error - State not initialized.\n");
@@ -3093,6 +3215,12 @@ DLLEXPORT int subqg_simulation_step_batched(int gpu_index,
     }
     if (batch_count != cells) {
         fprintf(stderr, "[C] subqg_simulation_step_batched: batch_count (%d) must match initialized cell count (%d).\n", batch_count, cells);
+        return 0;
+    }
+
+    if (out_field_map && field_map_length < subqg_field_map_elements) {
+        fprintf(stderr, "[C] subqg_simulation_step_batched: field_map_length (%d) smaller than required elements (%d).\n",
+                field_map_length, subqg_field_map_elements);
         return 0;
     }
 
@@ -3148,7 +3276,9 @@ DLLEXPORT int subqg_simulation_step_batched(int gpu_index,
 
     FP_TYPE noise_level_fp = (FP_TYPE)subqg_noise_level;
     FP_TYPE threshold_fp = (FP_TYPE)subqg_threshold;
+    FP_TYPE noise_factor_fp = (FP_TYPE)get_noise_factor();
     cl_int cell_count_cl = (cl_int)cells;
+    cl_int write_field_map = (cl_int)(out_field_map != NULL);
 
     int arg_index = 0;
     err = CL_SUCCESS;
@@ -3163,7 +3293,10 @@ DLLEXPORT int subqg_simulation_step_batched(int gpu_index,
     err |= clSetKernelArg(subqg_simulation_kernel, arg_index++, sizeof(cl_mem), &subqg_rng_spin_buffer);
     err |= clSetKernelArg(subqg_simulation_kernel, arg_index++, sizeof(FP_TYPE), &noise_level_fp);
     err |= clSetKernelArg(subqg_simulation_kernel, arg_index++, sizeof(FP_TYPE), &threshold_fp);
+    err |= clSetKernelArg(subqg_simulation_kernel, arg_index++, sizeof(FP_TYPE), &noise_factor_fp);
     err |= clSetKernelArg(subqg_simulation_kernel, arg_index++, sizeof(cl_int), &cell_count_cl);
+    err |= clSetKernelArg(subqg_simulation_kernel, arg_index++, sizeof(cl_mem), &subqg_field_map_buffer);
+    err |= clSetKernelArg(subqg_simulation_kernel, arg_index++, sizeof(cl_int), &write_field_map);
 
     if (err != CL_SUCCESS) {
         fprintf(stderr, "[C] subqg_simulation_step_batched: Failed to set kernel args: %s (%d)\n", clGetErrorString(err), err);
@@ -3171,7 +3304,7 @@ DLLEXPORT int subqg_simulation_step_batched(int gpu_index,
     }
 
     size_t global_work_size = (size_t)cells;
-    err = clEnqueueNDRangeKernel(queue, subqg_simulation_kernel, 1, NULL, &global_work_size, NULL, 0, NULL, NULL);
+    err = ENQUEUE_KERNEL_PROFILED(subqg_simulation_kernel, 1, &global_work_size, NULL, "subqg_simulation_step");
     if (err != CL_SUCCESS) {
         fprintf(stderr, "[C] subqg_simulation_step_batched: Failed to enqueue kernel: %s (%d)\n", clGetErrorString(err), err);
         return 0;
@@ -3257,7 +3390,90 @@ DLLEXPORT int subqg_simulation_step_batched(int gpu_index,
         for (int i = 0; i < cells; ++i) { out_topology[i] = (int)topo_host[i]; }
         free(topo_host);
     }
+    if (out_field_map) {
+        size_t map_bytes = (size_t)subqg_field_map_elements * sizeof(FP_TYPE);
+        FP_TYPE* field_map_host = (FP_TYPE*)malloc(map_bytes);
+        if (!field_map_host) {
+            fprintf(stderr, "[C] subqg_simulation_step_batched: Failed to allocate field_map host buffer (%zu bytes).\n", map_bytes);
+            return 0;
+        }
+        err = clEnqueueReadBuffer(queue, subqg_field_map_buffer, CL_TRUE, 0, map_bytes, field_map_host, 0, NULL, NULL);
+        if (err != CL_SUCCESS) {
+            fprintf(stderr, "[C] subqg_simulation_step_batched: Failed to read field_map buffer: %s (%d)\n", clGetErrorString(err), err);
+            free(field_map_host);
+            return 0;
+        }
+        size_t copy_elems = (size_t)field_map_length;
+        if (copy_elems > (size_t)subqg_field_map_elements) {
+            copy_elems = (size_t)subqg_field_map_elements;
+        }
+        for (size_t i = 0; i < copy_elems; ++i) {
+            out_field_map[i] = (float)field_map_host[i];
+        }
+        free(field_map_host);
+    }
 
+    return 1;
+}
+
+DLLEXPORT int subqg_inject_agents(int gpu_index, const HPIOAgent* agents, int count) {
+    (void)gpu_index;
+    if (!subqg_state_initialized) {
+        fprintf(stderr, "[C] subqg_inject_agents: Error - State not initialized.\n");
+        return 0;
+    }
+    if (!subqg_agent_kernel) {
+        fprintf(stderr, "[C] subqg_inject_agents: Error - Agent kernel not compiled.\n");
+        return 0;
+    }
+    if (count <= 0 || !agents) {
+        return 1;
+    }
+    size_t required_bytes = (size_t)count * sizeof(HPIOAgent);
+    if (!subqg_agent_buffer || subqg_agent_buffer_bytes < required_bytes) {
+        if (subqg_agent_buffer) {
+            clReleaseMemObject(subqg_agent_buffer);
+            subqg_agent_buffer = NULL;
+            subqg_agent_buffer_bytes = 0;
+        }
+        cl_int err = CL_SUCCESS;
+        subqg_agent_buffer = clCreateBuffer(context, CL_MEM_READ_ONLY, required_bytes, NULL, &err);
+        if (!subqg_agent_buffer || err != CL_SUCCESS) {
+            fprintf(stderr, "[C] subqg_inject_agents: Failed to allocate agent buffer: %s (%d)\n", clGetErrorString(err), err);
+            return 0;
+        }
+        subqg_agent_buffer_bytes = required_bytes;
+    }
+
+    cl_int err = clEnqueueWriteBuffer(queue, subqg_agent_buffer, CL_TRUE, 0, required_bytes, agents, 0, NULL, NULL);
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "[C] subqg_inject_agents: Failed to upload agents: %s (%d)\n", clGetErrorString(err), err);
+        return 0;
+    }
+
+    cl_int agent_count_cl = (cl_int)count;
+    cl_int grid_w = (cl_int)(subqg_grid_width > 0 ? subqg_grid_width : subqg_cell_count);
+    cl_int grid_h = (cl_int)(subqg_grid_height > 0 ? subqg_grid_height : 1);
+
+    int arg = 0;
+    err  = clSetKernelArg(subqg_agent_kernel, arg++, sizeof(cl_mem), &subqg_energy_buffer);
+    err |= clSetKernelArg(subqg_agent_kernel, arg++, sizeof(cl_mem), &subqg_phase_buffer);
+    err |= clSetKernelArg(subqg_agent_kernel, arg++, sizeof(cl_mem), &subqg_field_map_buffer);
+    err |= clSetKernelArg(subqg_agent_kernel, arg++, sizeof(cl_mem), &subqg_agent_buffer);
+    err |= clSetKernelArg(subqg_agent_kernel, arg++, sizeof(cl_int), &agent_count_cl);
+    err |= clSetKernelArg(subqg_agent_kernel, arg++, sizeof(cl_int), &grid_w);
+    err |= clSetKernelArg(subqg_agent_kernel, arg++, sizeof(cl_int), &grid_h);
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "[C] subqg_inject_agents: Failed to set kernel args: %s (%d)\n", clGetErrorString(err), err);
+        return 0;
+    }
+
+    size_t global = (size_t)(subqg_field_map_elements > 0 ? subqg_field_map_elements : subqg_cell_count);
+    err = ENQUEUE_KERNEL_PROFILED(subqg_agent_kernel, 1, &global, NULL, "subqg_inject_agents");
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "[C] subqg_inject_agents: Kernel launch failed: %s (%d)\n", clGetErrorString(err), err);
+        return 0;
+    }
     return 1;
 }
 
@@ -3819,6 +4035,208 @@ cleanup:
     return success;
 }
 
+DLLEXPORT int quantum_upload_gate_sequence(int gpu_index, const QuantumGate* gates, int gate_count) {
+    (void)gpu_index;
+    if (gate_count <= 0 || !gates) {
+        fprintf(stderr, "[C] Quantum: Invalid gate sequence upload (count=%d, ptr=%p).\n", gate_count, (const void*)gates);
+        return 0;
+    }
+    if (!ensure_quantum_kernels_ready()) {
+        return 0;
+    }
+
+    size_t bytes = (size_t)gate_count * sizeof(QuantumGate);
+    if (quantum_gate_host_sequence) {
+        free(quantum_gate_host_sequence);
+        quantum_gate_host_sequence = NULL;
+    }
+    if (quantum_gate_sequence_buffer) {
+        clReleaseMemObject(quantum_gate_sequence_buffer);
+        quantum_gate_sequence_buffer = NULL;
+    }
+
+    quantum_gate_host_sequence = (QuantumGate*)malloc(bytes);
+    if (!quantum_gate_host_sequence) {
+        fprintf(stderr, "[C] Quantum: Failed to allocate host gate sequence (%zu bytes).\n", bytes);
+        quantum_gate_host_count = 0;
+        quantum_gate_sequence_bytes = 0;
+        return 0;
+    }
+    memcpy(quantum_gate_host_sequence, gates, bytes);
+    quantum_gate_host_count = (size_t)gate_count;
+    quantum_gate_sequence_bytes = bytes;
+    quantum_gate_sequence_last_qubits = 0;
+
+    cl_int err = CL_SUCCESS;
+    quantum_gate_sequence_buffer = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                                  bytes, (void*)gates, &err);
+    if (!quantum_gate_sequence_buffer || err != CL_SUCCESS) {
+        if (quantum_gate_sequence_buffer) {
+            clReleaseMemObject(quantum_gate_sequence_buffer);
+            quantum_gate_sequence_buffer = NULL;
+        }
+        fprintf(stderr, "[C] Quantum: Warning - Failed to create device gate sequence buffer: %s (%d). Using host path only.\n",
+                clGetErrorString(err), err);
+    }
+
+    return 1;
+}
+
+DLLEXPORT int quantum_apply_gate_sequence(int gpu_index, int num_qubits, float* out_probabilities, int probability_length) {
+    (void)gpu_index;
+    if (num_qubits <= 0) {
+        fprintf(stderr, "[C] Quantum: Invalid qubit count %d for gate sequence.\n", num_qubits);
+        return 0;
+    }
+    size_t dimension = (size_t)1 << num_qubits;
+    if (out_probabilities && probability_length > 0 && (size_t)probability_length < dimension) {
+        fprintf(stderr, "[C] Quantum: Probability buffer too small (have %d need %zu).\n",
+                probability_length, dimension);
+        return 0;
+    }
+    if (!quantum_gate_host_sequence || quantum_gate_host_count == 0) {
+        fprintf(stderr, "[C] Quantum: No gate sequence uploaded.\n");
+        return 0;
+    }
+    if (!ensure_quantum_kernels_ready()) {
+        return 0;
+    }
+
+    QuantumStateGPU state = {0};
+    if (!quantum_allocate_state(num_qubits, &state)) {
+        return 0;
+    }
+
+    cl_float2* host_state = (cl_float2*)calloc(state.dimension, sizeof(cl_float2));
+    if (!host_state) {
+        fprintf(stderr, "[C] Quantum: Failed to allocate host state buffer (%zu bytes).\n",
+                state.dimension * sizeof(cl_float2));
+        quantum_release_state(&state);
+        return 0;
+    }
+    host_state[0] = make_complex(1.0f, 0.0f);
+
+    int success = 0;
+    for (size_t i = 0; i < quantum_gate_host_count; ++i) {
+        if (!quantum_apply_gate_cpu(host_state, num_qubits, &quantum_gate_host_sequence[i])) {
+            goto cleanup;
+        }
+    }
+
+    {
+        cl_int err = clEnqueueWriteBuffer(queue, state.buffer, CL_TRUE, 0,
+                                          state.dimension * sizeof(cl_float2), host_state, 0, NULL, NULL);
+        if (err != CL_SUCCESS) {
+            fprintf(stderr, "[C] Quantum: Failed to upload state after gate sequence: %s (%d)\n",
+                    clGetErrorString(err), err);
+            goto cleanup;
+        }
+    }
+
+    cl_mem probabilities = NULL;
+    if (!quantum_compute_probabilities_gpu(&state, &probabilities)) {
+        goto cleanup;
+    }
+
+    float* host_probs = (float*)malloc(dimension * sizeof(float));
+    if (!host_probs) {
+        fprintf(stderr, "[C] Quantum: Failed to allocate host probability buffer (%zu bytes).\n",
+                dimension * sizeof(float));
+        clReleaseMemObject(probabilities);
+        goto cleanup;
+    }
+
+    cl_int err = clEnqueueReadBuffer(queue, probabilities, CL_TRUE, 0,
+                                     dimension * sizeof(float), host_probs, 0, NULL, NULL);
+    clReleaseMemObject(probabilities);
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "[C] Quantum: Failed to read probability buffer: %s (%d)\n",
+                clGetErrorString(err), err);
+        free(host_probs);
+        goto cleanup;
+    }
+
+    if (out_probabilities) {
+        memcpy(out_probabilities, host_probs, dimension * sizeof(float));
+    }
+    free(host_probs);
+    success = 1;
+    quantum_gate_sequence_last_qubits = num_qubits;
+
+cleanup:
+    free(host_state);
+    quantum_release_state(&state);
+    return success;
+}
+
+static int infer_gate_sequence_qubits(void) {
+    int max_qubit = -1;
+    if (!quantum_gate_host_sequence || quantum_gate_host_count == 0) {
+        return 0;
+    }
+    for (size_t i = 0; i < quantum_gate_host_count; ++i) {
+        const QuantumGate* gate = &quantum_gate_host_sequence[i];
+        int indices[3] = {(int)gate->target, (int)gate->control, (int)gate->control2};
+        for (int j = 0; j < 3; ++j) {
+            if (indices[j] > max_qubit) {
+                max_qubit = indices[j];
+            }
+        }
+    }
+    return max_qubit >= 0 ? (max_qubit + 1) : 0;
+}
+
+DLLEXPORT int quantum_export_to_qasm(int gpu_index, const char* filepath) {
+    (void)gpu_index;
+    if (!filepath || !quantum_gate_host_sequence || quantum_gate_host_count == 0) {
+        fprintf(stderr, "[C] Quantum: Cannot export QASM – missing filepath or gate sequence.\n");
+        return 0;
+    }
+
+    int num_qubits = quantum_gate_sequence_last_qubits;
+    if (num_qubits <= 0) {
+        num_qubits = infer_gate_sequence_qubits();
+    }
+    if (num_qubits <= 0) {
+        fprintf(stderr, "[C] Quantum: Unable to infer qubit count for QASM export.\n");
+        return 0;
+    }
+
+    FILE* fp = fopen(filepath, "w");
+    if (!fp) {
+        fprintf(stderr, "[C] Quantum: Failed to open QASM file '%s' for writing.\n", filepath);
+        return 0;
+    }
+
+    fprintf(fp, "OPENQASM 2.0;\ninclude \"qelib1.inc\";\n");
+    fprintf(fp, "qreg q[%d];\n", num_qubits);
+
+    for (size_t i = 0; i < quantum_gate_host_count; ++i) {
+        const QuantumGate* gate = &quantum_gate_host_sequence[i];
+        const char* name = gate->name;
+        if (!name) { continue; }
+
+        if (strncmp(name, "U3", 2) == 0 || strncmp(name, "u3", 2) == 0) {
+            float theta = gate->params[0];
+            float phi = gate->params[1];
+            float lambda = gate->params[2];
+            fprintf(fp, "u3(%f,%f,%f) q[%u];\n", theta, phi, lambda, gate->target);
+        } else if (strncmp(name, "CRZ", 3) == 0 || strncmp(name, "crz", 3) == 0) {
+            float theta = gate->params[0];
+            fprintf(fp, "crz(%f) q[%u],q[%u];\n", theta, gate->control, gate->target);
+        } else if (strncmp(name, "SWAP", 4) == 0 || strncmp(name, "swap", 4) == 0) {
+            fprintf(fp, "swap q[%u],q[%u];\n", gate->control, gate->target);
+        } else if (strncmp(name, "TOFF", 4) == 0 || strncmp(name, "ccx", 3) == 0) {
+            fprintf(fp, "ccx q[%u],q[%u],q[%u];\n", gate->control, gate->control2, gate->target);
+        } else {
+            fprintf(fp, "// Unsupported gate '%s'\n", name);
+        }
+    }
+
+    fclose(fp);
+    return 1;
+}
+
 /**
  * @brief Shuts down the OpenCL driver and releases all resources.
  */
@@ -3895,6 +4313,23 @@ typedef struct {
     float reward_weight;
     float high_confidence_threshold;
 } ShapeLossRewardPenaltyListCommandData;
+
+typedef struct {
+    char name[64];
+    float duration_ms;
+    float error;
+    float variance;
+} KernelMetricsSample;
+
+typedef struct {
+    char name[8];
+    cl_uint arity;
+    cl_uint control;
+    cl_uint target;
+    cl_uint control2;
+    float params[4];
+    cl_float2 matrix[8][8];
+} QuantumGate;
 // ------------------------------------
 
 /**
@@ -3970,6 +4405,76 @@ static cl_int get_reduction_params_helper(size_t* lws_out, size_t* local_mem_byt
     return CL_SUCCESS;
 }
 
+static cl_int enqueue_kernel_with_metrics(cl_kernel kernel,
+                                          cl_uint work_dim,
+                                          const size_t* global_work_size,
+                                          const size_t* local_work_size,
+                                          const char* kernel_name,
+                                          float* error_out,
+                                          float* variance_out) {
+    if (!queue) {
+        return CL_INVALID_COMMAND_QUEUE;
+    }
+    cl_event evt = NULL;
+    cl_int err = clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL,
+                                        global_work_size, local_work_size,
+                                        0, NULL, &evt);
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "[C] enqueue_kernel_with_metrics: Failed to launch %s: %s (%d)\n",
+                kernel_name ? kernel_name : "<unknown>", clGetErrorString(err), err);
+        return err;
+    }
+    if (evt) {
+        clWaitForEvents(1, &evt);
+    } else {
+        clFinish(queue);
+    }
+
+    cl_ulong start_time = 0;
+    cl_ulong end_time = 0;
+    if (evt) {
+        clGetEventProfilingInfo(evt, CL_PROFILING_COMMAND_START, sizeof(start_time), &start_time, NULL);
+        clGetEventProfilingInfo(evt, CL_PROFILING_COMMAND_END, sizeof(end_time), &end_time, NULL);
+        clReleaseEvent(evt);
+    }
+    double duration_ns = (double)(end_time > start_time ? (end_time - start_time) : 0ULL);
+    float duration_ms = (float)(duration_ns * 1e-6);
+    if (duration_ms <= 0.0f) {
+        duration_ms = 0.01f;
+    }
+
+    float local_variance = duration_ms * 0.001f * get_noise_factor();
+    if (local_variance < 1e-6f) {
+        local_variance = 1e-6f;
+    }
+    float local_error = 0.0f;
+    noisectrl_measure(local_variance, &local_error, &local_variance);
+
+    if (error_out) { *error_out = local_error; }
+    if (variance_out) { *variance_out = local_variance; }
+    if (g_measurement_error_target) { *g_measurement_error_target = local_error; }
+    if (g_measurement_variance_target) { *g_measurement_variance_target = local_variance; }
+
+    if (kernel_name) {
+        strncpy(g_last_metrics.name, kernel_name, sizeof(g_last_metrics.name) - 1);
+        g_last_metrics.name[sizeof(g_last_metrics.name) - 1] = '\0';
+    } else {
+        strncpy(g_last_metrics.name, "<unnamed>", sizeof(g_last_metrics.name) - 1);
+        g_last_metrics.name[sizeof(g_last_metrics.name) - 1] = '\0';
+    }
+    g_last_metrics.duration_ms = duration_ms;
+    g_last_metrics.error = local_error;
+    g_last_metrics.variance = local_variance;
+
+    printf("[C] Kernel %s took %.3f ms (variance=%.5f, noise=%.3f)\n",
+           g_last_metrics.name, duration_ms, local_variance, get_noise_factor());
+
+    return CL_SUCCESS;
+}
+
+#define ENQUEUE_KERNEL_PROFILED(kernel_handle, work_dim, global_ptr, local_ptr, kernel_label) \
+    enqueue_kernel_with_metrics(kernel_handle, work_dim, global_ptr, local_ptr, kernel_label, NULL, NULL)
+
 static void release_subqg_resources(void) {
     if (!subqg_state_initialized) {
         return;
@@ -3990,6 +4495,8 @@ static void release_subqg_resources(void) {
     RELEASE_SUBQG_BUFFER(subqg_rng_energy_buffer);
     RELEASE_SUBQG_BUFFER(subqg_rng_phase_buffer);
     RELEASE_SUBQG_BUFFER(subqg_rng_spin_buffer);
+    RELEASE_SUBQG_BUFFER(subqg_field_map_buffer);
+    RELEASE_SUBQG_BUFFER(subqg_agent_buffer);
 
     #undef RELEASE_SUBQG_BUFFER
 
@@ -4000,6 +4507,10 @@ static void release_subqg_resources(void) {
     subqg_rng_state = 0;
     subqg_deterministic_mode = 0;
     subqg_state_initialized = 0;
+    subqg_field_map_elements = 0;
+    subqg_grid_width = 0;
+    subqg_grid_height = 0;
+    subqg_agent_buffer_bytes = 0;
 }
 
 static void release_quantum_resources(void) {
@@ -4011,8 +4522,18 @@ static void release_quantum_resources(void) {
         clReleaseMemObject(quantum_probability_buffer);
         quantum_probability_buffer = NULL;
     }
+    if (quantum_gate_sequence_buffer) {
+        clReleaseMemObject(quantum_gate_sequence_buffer);
+        quantum_gate_sequence_buffer = NULL;
+    }
+    if (quantum_gate_host_sequence) {
+        free(quantum_gate_host_sequence);
+        quantum_gate_host_sequence = NULL;
+    }
     quantum_temp_state_bytes = 0;
     quantum_probability_bytes = 0;
+    quantum_gate_sequence_bytes = 0;
+    quantum_gate_host_count = 0;
 }
 
 static cl_float2 make_complex(float real, float imag) {
@@ -4020,6 +4541,107 @@ static cl_float2 make_complex(float real, float imag) {
     value.s[0] = real;
     value.s[1] = imag;
     return value;
+}
+
+static cl_float2 complex_add(cl_float2 a, cl_float2 b) {
+    return make_complex(a.s[0] + b.s[0], a.s[1] + b.s[1]);
+}
+
+static cl_float2 complex_mul(cl_float2 a, cl_float2 b) {
+    float real = a.s[0] * b.s[0] - a.s[1] * b.s[1];
+    float imag = a.s[0] * b.s[1] + a.s[1] * b.s[0];
+    return make_complex(real, imag);
+}
+
+static cl_float2 complex_zero(void) {
+    return make_complex(0.0f, 0.0f);
+}
+
+static size_t apply_gate_compose_index(size_t base, const int* qubits, int arity, size_t local_index) {
+    size_t idx = base;
+    for (int bit = 0; bit < arity; ++bit) {
+        size_t mask = (size_t)1 << qubits[bit];
+        if ((local_index >> bit) & 1U) {
+            idx |= mask;
+        }
+    }
+    return idx;
+}
+
+static int quantum_apply_gate_cpu(cl_float2* state, int num_qubits, const QuantumGate* gate) {
+    if (!state || !gate) { return 0; }
+    int arity = (int)gate->arity;
+    if (arity <= 0 || arity > 3) {
+        fprintf(stderr, "[C] Quantum: Unsupported gate arity %d.\n", arity);
+        return 0;
+    }
+
+    int qubits[3] = {0, 0, 0};
+    if (arity >= 1) { qubits[0] = (int)gate->target; }
+    if (arity >= 2) { qubits[1] = (int)gate->control; }
+    if (arity >= 3) { qubits[2] = (int)gate->control2; }
+
+    // Maintain order: for two-qubit gates default to control-target ordering
+    if (arity == 2) {
+        qubits[0] = (int)gate->control;
+        qubits[1] = (int)gate->target;
+    }
+    if (arity == 3) {
+        qubits[0] = (int)gate->control;
+        qubits[1] = (int)gate->control2;
+        qubits[2] = (int)gate->target;
+    }
+
+    for (int i = 0; i < arity; ++i) {
+        if (qubits[i] < 0 || qubits[i] >= num_qubits) {
+            fprintf(stderr, "[C] Quantum: Gate references invalid qubit index %d (num_qubits=%d).\n",
+                    qubits[i], num_qubits);
+            return 0;
+        }
+        for (int j = i + 1; j < arity; ++j) {
+            if (qubits[i] == qubits[j]) {
+                fprintf(stderr, "[C] Quantum: Gate references duplicate qubit index %d.\n", qubits[i]);
+                return 0;
+            }
+        }
+    }
+
+    size_t dimension = (size_t)1 << num_qubits;
+    size_t subspace = (size_t)1 << arity;
+    size_t gate_mask = 0;
+    for (int i = 0; i < arity; ++i) {
+        gate_mask |= ((size_t)1 << qubits[i]);
+    }
+
+    cl_float2 input_vec[8];
+    cl_float2 output_vec[8];
+
+    for (size_t base = 0; base < dimension; ++base) {
+        if ((base & gate_mask) != 0) {
+            continue;
+        }
+
+        for (size_t col = 0; col < subspace; ++col) {
+            size_t idx = apply_gate_compose_index(base, qubits, arity, col);
+            input_vec[col] = state[idx];
+        }
+
+        for (size_t row = 0; row < subspace; ++row) {
+            cl_float2 acc = complex_zero();
+            for (size_t col = 0; col < subspace; ++col) {
+                cl_float2 m = gate->matrix[row][col];
+                acc = complex_add(acc, complex_mul(m, input_vec[col]));
+            }
+            output_vec[row] = acc;
+        }
+
+        for (size_t row = 0; row < subspace; ++row) {
+            size_t idx = apply_gate_compose_index(base, qubits, arity, row);
+            state[idx] = output_vec[row];
+        }
+    }
+
+    return 1;
 }
 
 static int ensure_quantum_kernels_ready(void) {
@@ -4030,7 +4652,7 @@ static int ensure_quantum_kernels_ready(void) {
     if (!quantum_program || !quantum_single_qubit_kernel || !quantum_controlled_phase_kernel ||
         !quantum_controlled_not_kernel || !quantum_phase_oracle_kernel || !quantum_phase_zero_kernel ||
         !quantum_modexp_kernel || !quantum_swap_kernel || !quantum_probability_kernel ||
-        !quantum_expectation_pauli_z_kernel) {
+        !quantum_expectation_pauli_z_kernel || !quantum_apply_gate_kernel) {
         fprintf(stderr, "[C] Quantum: Kernels not compiled. Ensure initialize_gpu succeeded.\n");
         return 0;
     }
@@ -4225,7 +4847,7 @@ static int quantum_apply_single_qubit_gate(QuantumStateGPU* state, int target,
         fprintf(stderr, "[C] Quantum: Failed to set args for single qubit gate: %s (%d)\n", clGetErrorString(err), err);
         return 0;
     }
-    err = clEnqueueNDRangeKernel(queue, quantum_single_qubit_kernel, 1, NULL, &global, NULL, 0, NULL, NULL);
+    err = ENQUEUE_KERNEL_PROFILED(quantum_single_qubit_kernel, 1, &global, NULL, "quantum_apply_single_qubit");
     if (err != CL_SUCCESS) {
         fprintf(stderr, "[C] Quantum: Failed to enqueue single qubit gate: %s (%d)\n", clGetErrorString(err), err);
         return 0;
@@ -4316,7 +4938,7 @@ static int quantum_apply_controlled_phase(QuantumStateGPU* state, int control, i
         return 0;
     }
     size_t global = state->dimension;
-    err = clEnqueueNDRangeKernel(queue, quantum_controlled_phase_kernel, 1, NULL, &global, NULL, 0, NULL, NULL);
+    err = ENQUEUE_KERNEL_PROFILED(quantum_controlled_phase_kernel, 1, &global, NULL, "quantum_apply_controlled_phase");
     if (err != CL_SUCCESS) {
         fprintf(stderr, "[C] Quantum: Failed to enqueue controlled phase: %s (%d)\n", clGetErrorString(err), err);
         return 0;
@@ -4349,7 +4971,7 @@ static int quantum_apply_controlled_not(QuantumStateGPU* state, int control, int
         fprintf(stderr, "[C] Quantum: Failed to set args for controlled NOT: %s (%d)\n", clGetErrorString(err), err);
         return 0;
     }
-    err = clEnqueueNDRangeKernel(queue, quantum_controlled_not_kernel, 1, NULL, &global, NULL, 0, NULL, NULL);
+    err = ENQUEUE_KERNEL_PROFILED(quantum_controlled_not_kernel, 1, &global, NULL, "quantum_apply_controlled_not");
     if (err != CL_SUCCESS) {
         fprintf(stderr, "[C] Quantum: Failed to enqueue controlled NOT: %s (%d)\n", clGetErrorString(err), err);
         return 0;
@@ -4385,7 +5007,7 @@ static int quantum_swap_qubits_out_of_place(QuantumStateGPU* state, int q1, int 
         return 0;
     }
     size_t global = state->dimension;
-    err = clEnqueueNDRangeKernel(queue, quantum_swap_kernel, 1, NULL, &global, NULL, 0, NULL, NULL);
+    err = ENQUEUE_KERNEL_PROFILED(quantum_swap_kernel, 1, &global, NULL, "quantum_swap_qubits");
     if (err != CL_SUCCESS) {
         fprintf(stderr, "[C] Quantum: Failed to enqueue swap kernel: %s (%d)\n", clGetErrorString(err), err);
         return 0;
@@ -4452,7 +5074,7 @@ static int quantum_apply_modular_exponentiation(QuantumStateGPU* state, int num_
         return 0;
     }
     size_t global = state->dimension;
-    err = clEnqueueNDRangeKernel(queue, quantum_modexp_kernel, 1, NULL, &global, NULL, 0, NULL, NULL);
+    err = ENQUEUE_KERNEL_PROFILED(quantum_modexp_kernel, 1, &global, NULL, "quantum_modular_exponentiation");
     if (err != CL_SUCCESS) {
         fprintf(stderr, "[C] Quantum: Failed to enqueue modular exponentiation: %s (%d)\n", clGetErrorString(err), err);
         return 0;
@@ -4499,7 +5121,7 @@ static int quantum_apply_grover_oracle(QuantumStateGPU* state, uint64_t mask, ui
         return 0;
     }
     size_t global = state->dimension;
-    err = clEnqueueNDRangeKernel(queue, quantum_phase_oracle_kernel, 1, NULL, &global, NULL, 0, NULL, NULL);
+    err = ENQUEUE_KERNEL_PROFILED(quantum_phase_oracle_kernel, 1, &global, NULL, "quantum_phase_oracle");
     if (err != CL_SUCCESS) {
         fprintf(stderr, "[C] Quantum: Failed to enqueue oracle kernel: %s (%d)\n", clGetErrorString(err), err);
         return 0;
@@ -4527,7 +5149,7 @@ static int quantum_apply_grover_diffusion(QuantumStateGPU* state) {
         fprintf(stderr, "[C] Quantum: Failed to set phase-zero args: %s (%d)\n", clGetErrorString(err), err);
         return 0;
     }
-    err = clEnqueueNDRangeKernel(queue, quantum_phase_zero_kernel, 1, NULL, &dimension, NULL, 0, NULL, NULL);
+    err = ENQUEUE_KERNEL_PROFILED(quantum_phase_zero_kernel, 1, &dimension, NULL, "quantum_phase_flip_except_zero");
     if (err != CL_SUCCESS) {
         fprintf(stderr, "[C] Quantum: Failed to enqueue phase-zero kernel: %s (%d)\n", clGetErrorString(err), err);
         return 0;
@@ -4555,7 +5177,7 @@ static int quantum_compute_probabilities_gpu(QuantumStateGPU* state, cl_mem* pro
         return 0;
     }
     size_t global = state->dimension;
-    err = clEnqueueNDRangeKernel(queue, quantum_probability_kernel, 1, NULL, &global, NULL, 0, NULL, NULL);
+    err = ENQUEUE_KERNEL_PROFILED(quantum_probability_kernel, 1, &global, NULL, "quantum_compute_probabilities");
     if (err != CL_SUCCESS) {
         fprintf(stderr, "[C] Quantum: Failed to enqueue probability kernel: %s (%d)\n", clGetErrorString(err), err);
         return 0;
@@ -4584,7 +5206,7 @@ static int quantum_expectation_pauli_z_gpu(QuantumStateGPU* state, uint64_t z_ma
         return 0;
     }
     size_t global = state->dimension;
-    err = clEnqueueNDRangeKernel(queue, quantum_expectation_pauli_z_kernel, 1, NULL, &global, NULL, 0, NULL, NULL);
+    err = ENQUEUE_KERNEL_PROFILED(quantum_expectation_pauli_z_kernel, 1, &global, NULL, "quantum_expectation_pauli_z");
     if (err != CL_SUCCESS) {
         fprintf(stderr, "[C] Quantum: Failed to enqueue expectation kernel: %s (%d)\n", clGetErrorString(err), err);
         return 0;
@@ -4841,7 +5463,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             CHECK_CL_ERR(clSetKernelArg(kernel, 5, sizeof(cl_int), &cmd->N), "BMM Fwd Arg 5");
             CHECK_CL_ERR(clSetKernelArg(kernel, 6, sizeof(cl_int), &cmd->K), "BMM Fwd Arg 6");
             size_t gws[3] = { (size_t)cmd->N, (size_t)cmd->M, (size_t)cmd->B };
-            CHECK_CL_ERR(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, gws, NULL, 0, NULL, NULL), "BMM Fwd Enqueue");
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(kernel, 3, gws, NULL, "matmul_forward"), "BMM Fwd Enqueue");
             return 1;
         }
         case COMMAND_SOFTMAX_ROWWISE: {
@@ -4860,7 +5482,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             CHECK_CL_ERR(clSetKernelArg(kernel, 5, scratch_bytes, NULL), "Softmax Fwd Arg 5 (scratch sum)");
             size_t gws[1] = { (size_t)cmd->num_rows * workgroup };
             size_t lws[1] = { workgroup };
-            CHECK_CL_ERR(clEnqueueNDRangeKernel(queue, kernel, 1, NULL, gws, lws, 0, NULL, NULL), "Softmax Fwd Enqueue");
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(kernel, 1, gws, lws, "softmax_rowwise"), "Softmax Fwd Enqueue");
             return 1;
         }
         case COMMAND_GELU_ELEMENTWISE: {
@@ -4873,7 +5495,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             CHECK_CL_ERR(clSetKernelArg(kernel, 1, sizeof(cl_mem), &out), "GELU Fwd Arg 1");
             CHECK_CL_ERR(clSetKernelArg(kernel, 2, sizeof(cl_int), &cmd->num_elements), "GELU Fwd Arg 2");
             size_t gws[1] = { (size_t)cmd->num_elements };
-            CHECK_CL_ERR(clEnqueueNDRangeKernel(queue, kernel, 1, NULL, gws, NULL, 0, NULL, NULL), "GELU Fwd Enqueue");
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(kernel, 1, gws, NULL, "gelu_forward"), "GELU Fwd Enqueue");
             return 1;
         }
         case COMMAND_ADD_ELEMENTWISE: {
@@ -4887,7 +5509,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
              CHECK_CL_ERR(clSetKernelArg(kernel, 2, sizeof(cl_mem), &c), "Add Fwd Arg 2");
              CHECK_CL_ERR(clSetKernelArg(kernel, 3, sizeof(cl_int), &cmd->num_elements), "Add Fwd Arg 3");
              size_t gws[1] = { (size_t)cmd->num_elements };
-             CHECK_CL_ERR(clEnqueueNDRangeKernel(queue, kernel, 1, NULL, gws, NULL, 0, NULL, NULL), "Add Fwd Enqueue");
+             CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(kernel, 1, gws, NULL, "add_forward"), "Add Fwd Enqueue");
              return 1;
         }
         case COMMAND_MUL_ELEMENTWISE: {
@@ -4901,7 +5523,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             CHECK_CL_ERR(clSetKernelArg(kernel, 2, sizeof(cl_mem), &c), "Mul Fwd Arg 2");
             CHECK_CL_ERR(clSetKernelArg(kernel, 3, sizeof(cl_int), &cmd->num_elements), "Mul Fwd Arg 3");
             size_t gws[1] = { (size_t)cmd->num_elements };
-            CHECK_CL_ERR(clEnqueueNDRangeKernel(queue, kernel, 1, NULL, gws, NULL, 0, NULL, NULL), "Mul Fwd Enqueue");
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(kernel, 1, gws, NULL, "mul_forward"), "Mul Fwd Enqueue");
             return 1;
         }
         case COMMAND_LAYER_NORM: {
@@ -4916,7 +5538,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             CHECK_CL_ERR(clSetKernelArg(layernorm_kernel, 3, sizeof(cl_int), &cmd->row_size), "LayerNorm Fwd Arg 3");
             CHECK_CL_ERR(clSetKernelArg(layernorm_kernel, 4, sizeof(cl_float), &effective_eps), "LayerNorm Fwd Arg 4");
             size_t gws[1] = { (size_t)cmd->num_rows };
-            CHECK_CL_ERR(clEnqueueNDRangeKernel(queue, layernorm_kernel, 1, NULL, gws, NULL, 0, NULL, NULL), "LayerNorm Fwd Enqueue");
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(layernorm_kernel, 1, gws, NULL, "layernorm_forward"), "LayerNorm Fwd Enqueue");
             return 1;
         }
         case COMMAND_CLONE: {
@@ -4944,7 +5566,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
                 ((size_t)cmd->rows + tile - 1) / tile * tile
             };
             size_t lws[2] = { tile, tile };
-            CHECK_CL_ERR(clEnqueueNDRangeKernel(queue, kernel, 2, NULL, gws, lws, 0, NULL, NULL), "Transpose Fwd (2D) Enqueue");
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(kernel, 2, gws, lws, "transpose_forward"), "Transpose Fwd (2D) Enqueue");
             return 1;
         }
         case COMMAND_GELU_BACKWARD_ELEMENTWISE: {
@@ -4957,7 +5579,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             CHECK_CL_ERR(clSetKernelArg(gelu_backward_kernel, 2, sizeof(cl_mem), &grad_input_mem), "GELU Bwd Arg 2");
             CHECK_CL_ERR(clSetKernelArg(gelu_backward_kernel, 3, sizeof(cl_int), &cmd->num_elements), "GELU Bwd Arg 3");
             size_t gws[1] = { (size_t)cmd->num_elements };
-            CHECK_CL_ERR(clEnqueueNDRangeKernel(queue, gelu_backward_kernel, 1, NULL, gws, NULL, 0, NULL, NULL), "GELU Bwd Enqueue");
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(gelu_backward_kernel, 1, gws, NULL, "gelu_backward"), "GELU Bwd Enqueue");
             return 1;
         }
         case COMMAND_MATMUL_BACKWARD_DA: {
@@ -4975,7 +5597,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             CHECK_CL_ERR(clSetKernelArg(kernel, 5, sizeof(cl_int), &cmd->N), "MatMul dA Arg 5");
             CHECK_CL_ERR(clSetKernelArg(kernel, 6, sizeof(cl_int), &cmd->K), "MatMul dA Arg 6");
             size_t gws[3] = { (size_t)cmd->K, (size_t)cmd->M, (size_t)cmd->B };
-            CHECK_CL_ERR(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, gws, NULL, 0, NULL, NULL), "MatMul dA Enqueue");
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(kernel, 3, gws, NULL, "matmul_backward_da"), "MatMul dA Enqueue");
             return 1;
         }
         case COMMAND_MATMUL_BACKWARD_DB: {
@@ -4993,7 +5615,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             CHECK_CL_ERR(clSetKernelArg(kernel, 5, sizeof(cl_int), &cmd->N), "MatMul dB Arg 5");
             CHECK_CL_ERR(clSetKernelArg(kernel, 6, sizeof(cl_int), &cmd->K), "MatMul dB Arg 6");
             size_t gws[2] = { (size_t)cmd->N, (size_t)cmd->K };
-            CHECK_CL_ERR(clEnqueueNDRangeKernel(queue, kernel, 2, NULL, gws, NULL, 0, NULL, NULL), "MatMul dB Enqueue");
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(kernel, 2, gws, NULL, "matmul_backward_db"), "MatMul dB Enqueue");
             return 1;
         }
         case COMMAND_LAYER_NORM_BACKWARD: {
@@ -5009,7 +5631,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             CHECK_CL_ERR(clSetKernelArg(layernorm_backward_kernel, 4, sizeof(cl_int), &cmd->row_size), "LayerNorm Bwd Arg 4");
             CHECK_CL_ERR(clSetKernelArg(layernorm_backward_kernel, 5, sizeof(cl_float), &effective_eps), "LayerNorm Bwd Arg 5");
             size_t gws[1] = { (size_t)cmd->num_rows };
-            CHECK_CL_ERR(clEnqueueNDRangeKernel(queue, layernorm_backward_kernel, 1, NULL, gws, NULL, 0, NULL, NULL), "LayerNorm Bwd Enqueue");
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(layernorm_backward_kernel, 1, gws, NULL, "layernorm_backward"), "LayerNorm Bwd Enqueue");
             return 1;
         }
         case COMMAND_ADAM_UPDATE: {
@@ -5034,7 +5656,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             CHECK_CL_ERR(clSetKernelArg(adam_kernel, 10, sizeof(cl_float), &cmd->beta1_t), "Adam Arg 10");
             CHECK_CL_ERR(clSetKernelArg(adam_kernel, 11, sizeof(cl_float), &cmd->beta2_t), "Adam Arg 11");
             size_t gws[1] = { (size_t)cmd->num_elements };
-            CHECK_CL_ERR(clEnqueueNDRangeKernel(queue, adam_kernel, 1, NULL, gws, NULL, 0, NULL, NULL), "Adam Update Enqueue");
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(adam_kernel, 1, gws, NULL, "adam_update"), "Adam Update Enqueue");
             return 1;
         }
         case COMMAND_SOFTMAX_BACKWARD: {
@@ -5048,7 +5670,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             CHECK_CL_ERR(clSetKernelArg(softmax_backward_kernel, 3, sizeof(cl_int), &cmd->num_rows), "Softmax Bwd Arg 3");
             CHECK_CL_ERR(clSetKernelArg(softmax_backward_kernel, 4, sizeof(cl_int), &cmd->row_size), "Softmax Bwd Arg 4");
             size_t gws[1] = { (size_t)cmd->num_rows };
-            CHECK_CL_ERR(clEnqueueNDRangeKernel(queue, softmax_backward_kernel, 1, NULL, gws, NULL, 0, NULL, NULL), "Softmax Bwd Enqueue");
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(softmax_backward_kernel, 1, gws, NULL, "softmax_backward"), "Softmax Bwd Enqueue");
             return 1;
         }
          case COMMAND_MUL_BACKWARD: {
@@ -5067,7 +5689,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             CHECK_CL_ERR(clSetKernelArg(mul_backward_kernel, 4, sizeof(cl_mem), &dB_mem), "Mul Bwd Arg 4");
             CHECK_CL_ERR(clSetKernelArg(mul_backward_kernel, 5, sizeof(cl_int), &cmd->num_elements), "Mul Bwd Arg 5");
             size_t gws[1] = { (size_t)cmd->num_elements };
-            CHECK_CL_ERR(clEnqueueNDRangeKernel(queue, mul_backward_kernel, 1, NULL, gws, NULL, 0, NULL, NULL), "Mul Bwd Enqueue");
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(mul_backward_kernel, 1, gws, NULL, "mul_backward"), "Mul Bwd Enqueue");
             return 1;
         }
         case COMMAND_TRANSPOSE_BACKWARD: {
@@ -5086,7 +5708,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
                 ((size_t)cmd->cols_A + tile - 1) / tile * tile
             };
             size_t lws[2] = { tile, tile };
-            CHECK_CL_ERR(clEnqueueNDRangeKernel(queue, kernel, 2, NULL, gws, lws, 0, NULL, NULL), "Transpose Bwd (2D) Enqueue");
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(kernel, 2, gws, lws, "transpose_backward"), "Transpose Bwd (2D) Enqueue");
             return 1;
         }
         case COMMAND_EMBEDDING_LOOKUP: {
@@ -5102,7 +5724,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             CHECK_CL_ERR(clSetKernelArg(embedding_lookup_kernel, 4, sizeof(cl_int), &cmd->d), "Embedding Lookup Arg 4");
             CHECK_CL_ERR(clSetKernelArg(embedding_lookup_kernel, 5, sizeof(cl_int), &cmd->v), "Embedding Lookup Arg 5");
             size_t gws[2] = { (size_t)cmd->s, (size_t)cmd->b };
-            CHECK_CL_ERR(clEnqueueNDRangeKernel(queue, embedding_lookup_kernel, 2, NULL, gws, NULL, 0, NULL, NULL), "Embedding Lookup Enqueue");
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(embedding_lookup_kernel, 2, gws, NULL, "embedding_lookup"), "Embedding Lookup Enqueue");
             return 1;
         }
         case COMMAND_EMBEDDING_BACKWARD_PASS1: {
@@ -5124,7 +5746,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             if (num_groups == 0) return 1;
             size_t gws_aligned[1] = { num_groups * lws_reduce };
             size_t lws[1] = { lws_reduce };
-            CHECK_CL_ERR(clEnqueueNDRangeKernel(queue, embedding_backward_calc_delta_local_kernel, 1, NULL, gws_aligned, lws, 0, NULL, NULL), "Embed Bwd P1 Enqueue");
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(embedding_backward_calc_delta_local_kernel, 1, gws_aligned, lws, "embedding_backward_delta"), "Embed Bwd P1 Enqueue");
             return 1;
         }
         case COMMAND_REDUCE_SUM_AXIS01: {
@@ -5142,7 +5764,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             size_t num_groups = (size_t)cmd->N;
             size_t gws[1] = { num_groups * lws_reduce };
             size_t lws[1] = { lws_reduce };
-            CHECK_CL_ERR(clEnqueueNDRangeKernel(queue, reduce_sum_kernel, 1, NULL, gws, lws, 0, NULL, NULL), "ReduceSum Axis01 Enqueue");
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(reduce_sum_kernel, 1, gws, lws, "reduce_sum_axis01"), "ReduceSum Axis01 Enqueue");
             return 1;
         }
         case COMMAND_BROADCAST_ADD_BIAS: {
@@ -5156,7 +5778,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             CHECK_CL_ERR(clSetKernelArg(broadcast_add_kernel, 3, sizeof(cl_int), &cmd->M), "BroadcastAdd Arg 3");
             CHECK_CL_ERR(clSetKernelArg(broadcast_add_kernel, 4, sizeof(cl_int), &cmd->N), "BroadcastAdd Arg 4");
             size_t gws[3] = { (size_t)cmd->N, (size_t)cmd->M, (size_t)cmd->B };
-            CHECK_CL_ERR(clEnqueueNDRangeKernel(queue, broadcast_add_kernel, 3, NULL, gws, NULL, 0, NULL, NULL), "BroadcastAdd Enqueue");
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(broadcast_add_kernel, 3, gws, NULL, "broadcast_add"), "BroadcastAdd Enqueue");
             return 1;
         }
         case COMMAND_TRANSPOSE_BATCHED: {
@@ -5169,7 +5791,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             CHECK_CL_ERR(clSetKernelArg(transpose_batched_kernel, 2, sizeof(cl_int), &cmd->d1), "TransposeBatched Arg 2");
             CHECK_CL_ERR(clSetKernelArg(transpose_batched_kernel, 3, sizeof(cl_int), &cmd->d2), "TransposeBatched Arg 3");
             size_t gws[3] = { (size_t)cmd->d2, (size_t)cmd->d1, (size_t)cmd->B_flat };
-            CHECK_CL_ERR(clEnqueueNDRangeKernel(queue, transpose_batched_kernel, 3, NULL, gws, NULL, 0, NULL, NULL), "TransposeBatched (LastTwo) Enqueue");
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(transpose_batched_kernel, 3, gws, NULL, "transpose_batched"), "TransposeBatched (LastTwo) Enqueue");
             return 1;
         }
         case COMMAND_MATRIX_MULTIPLY_BATCHED: {
@@ -5186,7 +5808,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             CHECK_CL_ERR(clSetKernelArg(matmul_batched_kernel, 5, sizeof(cl_int), &cmd->N), "BMM Batched Fwd Arg 5");
             CHECK_CL_ERR(clSetKernelArg(matmul_batched_kernel, 6, sizeof(cl_int), &cmd->K), "BMM Batched Fwd Arg 6");
             size_t gws[3] = { (size_t)cmd->N, (size_t)cmd->M, (size_t)cmd->B };
-            CHECK_CL_ERR(clEnqueueNDRangeKernel(queue, matmul_batched_kernel, 3, NULL, gws, NULL, 0, NULL, NULL), "BMM Batched Fwd Enqueue");
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(matmul_batched_kernel, 3, gws, NULL, "matmul_batched"), "BMM Batched Fwd Enqueue");
             return 1;
         }
         case COMMAND_MATRIX_MULTIPLY_BATCHED_BACKWARD_DA: {
@@ -5203,7 +5825,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             CHECK_CL_ERR(clSetKernelArg(matmul_batched_backward_da_kernel, 5, sizeof(cl_int), &cmd->N), "MatMul Batched dA Arg 5");
             CHECK_CL_ERR(clSetKernelArg(matmul_batched_backward_da_kernel, 6, sizeof(cl_int), &cmd->K), "MatMul Batched dA Arg 6");
             size_t gws[3] = { (size_t)cmd->K, (size_t)cmd->M, (size_t)cmd->B };
-            CHECK_CL_ERR(clEnqueueNDRangeKernel(queue, matmul_batched_backward_da_kernel, 3, NULL, gws, NULL, 0, NULL, NULL), "MatMul Batched dA Enqueue");
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(matmul_batched_backward_da_kernel, 3, gws, NULL, "matmul_batched_backward_da"), "MatMul Batched dA Enqueue");
             return 1;
         }
         case COMMAND_MATRIX_MULTIPLY_BATCHED_BACKWARD_DB: {
@@ -5220,7 +5842,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             CHECK_CL_ERR(clSetKernelArg(matmul_batched_backward_db_kernel, 5, sizeof(cl_int), &cmd->N), "MatMul Batched dB Arg 5");
             CHECK_CL_ERR(clSetKernelArg(matmul_batched_backward_db_kernel, 6, sizeof(cl_int), &cmd->K), "MatMul Batched dB Arg 6");
             size_t gws[3] = { (size_t)cmd->N, (size_t)cmd->K, (size_t)cmd->B };
-            CHECK_CL_ERR(clEnqueueNDRangeKernel(queue, matmul_batched_backward_db_kernel, 3, NULL, gws, NULL, 0, NULL, NULL), "MatMul Batched dB Enqueue");
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(matmul_batched_backward_db_kernel, 3, gws, NULL, "matmul_batched_backward_db"), "MatMul Batched dB Enqueue");
             return 1;
         }
         case COMMAND_TRANSPOSE_12_BATCHED: {
@@ -5235,7 +5857,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             CHECK_CL_ERR(clSetKernelArg(transpose_12_batched_kernel, 4, sizeof(cl_int), &cmd->D2), "Transpose12 Arg 4");
             CHECK_CL_ERR(clSetKernelArg(transpose_12_batched_kernel, 5, sizeof(cl_int), &cmd->D3), "Transpose12 Arg 5");
             size_t gws[3] = { (size_t)cmd->D3, (size_t)cmd->D1, (size_t)cmd->D2 * cmd->B };
-            CHECK_CL_ERR(clEnqueueNDRangeKernel(queue, transpose_12_batched_kernel, 3, NULL, gws, NULL, 0, NULL, NULL), "Transpose12Batched Enqueue");
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(transpose_12_batched_kernel, 3, gws, NULL, "transpose_12_batched"), "Transpose12Batched Enqueue");
             return 1;
         }
         case COMMAND_LOG_SOFTMAX_STABLE: {
@@ -5254,7 +5876,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             CHECK_CL_ERR(clSetKernelArg(kernel, 5, scratch_bytes, NULL), "LogSoftmaxStable Arg 5 (scratch sum)");
             size_t gws[1] = { (size_t)cmd->B_S_rows * workgroup };
             size_t lws[1] = { workgroup };
-            CHECK_CL_ERR(clEnqueueNDRangeKernel(queue, kernel, 1, NULL, gws, lws, 0, NULL, NULL), "LogSoftmaxStable Enqueue");
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(kernel, 1, gws, lws, "log_softmax_stable"), "LogSoftmaxStable Enqueue");
             return 1;
         }
 		case COMMAND_CROSS_ENTROPY_LOSS_GRAD: {
@@ -5269,7 +5891,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             CHECK_CL_ERR(clSetKernelArg(cross_entropy_kernel, 4, sizeof(cl_int), &cmd->B_S_rows), "CrossEntropyLossGrad Arg 4 (num_rows)");
             CHECK_CL_ERR(clSetKernelArg(cross_entropy_kernel, 5, sizeof(cl_int), &cmd->V_cols), "CrossEntropyLossGrad Arg 5 (V)");
             size_t gws[1] = { (size_t)cmd->B_S_rows };
-            CHECK_CL_ERR(clEnqueueNDRangeKernel(queue, cross_entropy_kernel, 1, NULL, gws, NULL, 0, NULL, NULL), "CrossEntropyLossGrad Enqueue");
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(cross_entropy_kernel, 1, gws, NULL, "cross_entropy_grad"), "CrossEntropyLossGrad Enqueue");
             return 1;
         }
         case COMMAND_ADD_BROADCAST_PE: {
@@ -5283,7 +5905,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             CHECK_CL_ERR(clSetKernelArg(add_broadcast_pe_kernel, 3, sizeof(cl_int), &cmd->S), "AddBroadcastPE Arg 3");
             CHECK_CL_ERR(clSetKernelArg(add_broadcast_pe_kernel, 4, sizeof(cl_int), &cmd->E), "AddBroadcastPE Arg 4");
             size_t gws[3] = { (size_t)cmd->E, (size_t)cmd->S, (size_t)cmd->B };
-            CHECK_CL_ERR(clEnqueueNDRangeKernel(queue, add_broadcast_pe_kernel, 3, NULL, gws, NULL, 0, NULL, NULL), "AddBroadcastPE Enqueue");
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(add_broadcast_pe_kernel, 3, gws, NULL, "add_broadcast_pe"), "AddBroadcastPE Enqueue");
             return 1;
         }
         case COMMAND_HEBBIAN_OUTER_PRODUCT_UPDATE: {
@@ -5306,7 +5928,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             if (num_groups == 0) return 1;
             size_t gws_aligned[1] = { num_groups * lws_reduce };
             size_t lws[1] = { lws_reduce };
-            CHECK_CL_ERR(clEnqueueNDRangeKernel(queue, hebbian_update_local_reduce_kernel, 1, NULL, gws_aligned, lws, 0, NULL, NULL), "Hebbian Update Local Reduce Enqueue");
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(hebbian_update_local_reduce_kernel, 1, gws_aligned, lws, "hebbian_update"), "Hebbian Update Local Reduce Enqueue");
             return 1;
         }
         case COMMAND_THRESHOLD_SPIKE: {
@@ -5319,7 +5941,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             CHECK_CL_ERR(clSetKernelArg(threshold_spike_kernel, 2, sizeof(cl_float), &cmd->threshold), "Threshold Spike Arg 2");
             CHECK_CL_ERR(clSetKernelArg(threshold_spike_kernel, 3, sizeof(cl_int), &cmd->num_elements), "Threshold Spike Arg 3");
             size_t gws[1] = { (size_t)cmd->num_elements };
-            CHECK_CL_ERR(clEnqueueNDRangeKernel(queue, threshold_spike_kernel, 1, NULL, gws, NULL, 0, NULL, NULL), "Threshold Spike Enqueue");
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(threshold_spike_kernel, 1, gws, NULL, "threshold_spike"), "Threshold Spike Enqueue");
             return 1;
         }
         case COMMAND_ADD_BIAS_MN: {
@@ -5333,7 +5955,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
              CHECK_CL_ERR(clSetKernelArg(add_bias_mn_kernel, 3, sizeof(cl_int), &cmd->M), "AddBiasMN Arg 3 (M)");
              CHECK_CL_ERR(clSetKernelArg(add_bias_mn_kernel, 4, sizeof(cl_int), &cmd->N), "AddBiasMN Arg 4 (N)");
              size_t gws[2] = { (size_t)cmd->N, (size_t)cmd->M };
-             CHECK_CL_ERR(clEnqueueNDRangeKernel(queue, add_bias_mn_kernel, 2, NULL, gws, NULL, 0, NULL, NULL), "AddBiasMN Enqueue");
+             CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(add_bias_mn_kernel, 2, gws, NULL, "add_bias_mn"), "AddBiasMN Enqueue");
              return 1;
         }
         case COMMAND_DYNAMIC_TOKEN_ASSIGNMENT: {
@@ -5349,7 +5971,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             CHECK_CL_ERR(clSetKernelArg(dynamic_token_assign_kernel, 4, sizeof(cl_int), &cmd->E), "DynToken Assign Arg 4");
             CHECK_CL_ERR(clSetKernelArg(dynamic_token_assign_kernel, 5, sizeof(cl_int), &cmd->T), "DynToken Assign Arg 5");
             size_t gws[2] = { (size_t)cmd->S, (size_t)cmd->B };
-            CHECK_CL_ERR(clEnqueueNDRangeKernel(queue, dynamic_token_assign_kernel, 2, NULL, gws, NULL, 0, NULL, NULL), "DynToken Assign Enqueue");
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(dynamic_token_assign_kernel, 2, gws, NULL, "dynamic_token_assignment"), "DynToken Assign Enqueue");
             return 1;
         }
         case COMMAND_PAIRWISE_SIMILARITY: {
@@ -5363,7 +5985,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             CHECK_CL_ERR(clSetKernelArg(pairwise_similarity_kernel, 2, sizeof(cl_int), &cmd->N), "PairwiseSim Arg 2");
             CHECK_CL_ERR(clSetKernelArg(pairwise_similarity_kernel, 3, sizeof(cl_int), &cmd->D), "PairwiseSim Arg 3");
             size_t gws[2] = { (size_t)cmd->N, (size_t)cmd->N };
-            CHECK_CL_ERR(clEnqueueNDRangeKernel(queue, pairwise_similarity_kernel, 2, NULL, gws, NULL, 0, NULL, NULL), "PairwiseSim Enqueue");
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(pairwise_similarity_kernel, 2, gws, NULL, "pairwise_similarity"), "PairwiseSim Enqueue");
             return 1;
         }
         case COMMAND_PROTO_SEGMENTED_SUM: {
@@ -5381,7 +6003,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             CHECK_CL_ERR(clSetKernelArg(proto_segmented_sum_kernel, 5, sizeof(cl_int), &cmd->E), "ProtoSum Arg 5");
             CHECK_CL_ERR(clSetKernelArg(proto_segmented_sum_kernel, 6, sizeof(cl_int), &cmd->T), "ProtoSum Arg 6");
             size_t gws[1] = { (size_t)cmd->M_flat };
-            CHECK_CL_ERR(clEnqueueNDRangeKernel(queue, proto_segmented_sum_kernel, 1, NULL, gws, NULL, 0, NULL, NULL), "Proto Segmented Sum Enqueue");
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(proto_segmented_sum_kernel, 1, gws, NULL, "proto_segmented_sum"), "Proto Segmented Sum Enqueue");
             return 1;
         }
         case COMMAND_PROTO_UPDATE_STEP: {
@@ -5398,7 +6020,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             CHECK_CL_ERR(clSetKernelArg(proto_update_step_kernel, 4, sizeof(cl_int), &cmd->E), "ProtoUpdate Arg 4");
             CHECK_CL_ERR(clSetKernelArg(proto_update_step_kernel, 5, sizeof(cl_int), &cmd->T), "ProtoUpdate Arg 5");
             size_t gws[1] = { (size_t)cmd->T };
-            CHECK_CL_ERR(clEnqueueNDRangeKernel(queue, proto_update_step_kernel, 1, NULL, gws, NULL, 0, NULL, NULL), "Proto Update Step Enqueue");
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(proto_update_step_kernel, 1, gws, NULL, "proto_update_step"), "Proto Update Step Enqueue");
             return 1;
         }
         case COMMAND_SHAPE_LOSS_REWARD_PENALTY: {
@@ -5427,7 +6049,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             CHECK_CL_ERR(clSetKernelArg(shape_loss_reward_penalty_kernel, 9, sizeof(cl_int), &cmd->critical_target_class), "ShapeLoss Arg 9 (critical_target_class)");
             CHECK_CL_ERR(clSetKernelArg(shape_loss_reward_penalty_kernel, 10, sizeof(cl_int), &cmd->critical_predicted_class), "ShapeLoss Arg 10 (critical_predicted_class)");
             size_t gws[1] = { (size_t)cmd->num_samples };
-            CHECK_CL_ERR(clEnqueueNDRangeKernel(queue, shape_loss_reward_penalty_kernel, 1, NULL, gws, NULL, 0, NULL, NULL), "Shape Loss Reward/Penalty Enqueue");
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(shape_loss_reward_penalty_kernel, 1, gws, NULL, "shape_loss_reward_penalty"), "Shape Loss Reward/Penalty Enqueue");
             return 1;
         }
 
@@ -5471,7 +6093,7 @@ int submit_kernel_command(int gpu_index, GPUCommand command, void *data) {
             CHECK_CL_ERR(clSetKernelArg(shape_loss_reward_penalty_list_kernel, 10, sizeof(cl_float), &cmd->high_confidence_threshold), "ShapeLossList Arg 10 (high_confidence_threshold)");
 
             size_t gws[1] = { (size_t)cmd->num_samples };
-            CHECK_CL_ERR(clEnqueueNDRangeKernel(queue, shape_loss_reward_penalty_list_kernel, 1, NULL, gws, NULL, 0, NULL, NULL), "Shape Loss Reward/Penalty List Enqueue");
+            CHECK_CL_ERR(ENQUEUE_KERNEL_PROFILED(shape_loss_reward_penalty_list_kernel, 1, gws, NULL, "shape_loss_reward_penalty_list"), "Shape Loss Reward/Penalty List Enqueue");
             return 1;
         }
         // --- Ende NEU: Loss Shaping (List) ---
@@ -5900,6 +6522,35 @@ DLLEXPORT int execute_shape_loss_with_reward_penalty_list_gpu(
     if (!submit_kernel_command(gpu_index, COMMAND_SHAPE_LOSS_REWARD_PENALTY_LIST, &cmd_data)) {
         return 0;
     }
+    return 1;
+}
+
+DLLEXPORT void set_noise_level(int gpu_index, float value) {
+    (void)gpu_index;
+    set_noise_factor(value);
+}
+
+DLLEXPORT float get_noise_level(int gpu_index) {
+    (void)gpu_index;
+    return get_noise_factor();
+}
+
+DLLEXPORT void register_kernel_measurement_buffers(float* error_ptr, float* variance_ptr) {
+    g_measurement_error_target = error_ptr;
+    g_measurement_variance_target = variance_ptr;
+}
+
+DLLEXPORT void reset_kernel_measurement_buffers(void) {
+    g_measurement_error_target = NULL;
+    g_measurement_variance_target = NULL;
+}
+
+DLLEXPORT int get_last_kernel_metrics(int gpu_index, KernelMetricsSample* out_metrics) {
+    (void)gpu_index;
+    if (!out_metrics) {
+        return 0;
+    }
+    *out_metrics = g_last_metrics;
     return 1;
 }
 
