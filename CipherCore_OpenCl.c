@@ -3169,6 +3169,8 @@ DLLEXPORT int subqg_simulation_step(int gpu_index, float rng_energy, float rng_p
     int spin_tmp = 0;
     int topo_tmp = -1;
 
+    int cells = (subqg_cell_count > 0) ? subqg_cell_count : 1;
+
     float* field_map_tmp = NULL;
     if (out_field_map && field_map_length > 0) {
         field_map_tmp = (float*)malloc(sizeof(float) * (size_t)field_map_length);
@@ -3179,27 +3181,143 @@ DLLEXPORT int subqg_simulation_step(int gpu_index, float rng_energy, float rng_p
         }
     }
 
+    float* rng_energy_array = NULL;
+    float* rng_phase_array = NULL;
+    float* rng_spin_array = NULL;
+    int free_rng_arrays = 0;
+    if (cells > 1) {
+        size_t fp_bytes = sizeof(float) * (size_t)cells;
+        rng_energy_array = (float*)malloc(fp_bytes);
+        rng_phase_array = (float*)malloc(fp_bytes);
+        rng_spin_array = (float*)malloc(fp_bytes);
+        if (!rng_energy_array || !rng_phase_array || !rng_spin_array) {
+            fprintf(stderr, "[C] subqg_simulation_step: Failed to allocate RNG arrays (%zu bytes).\n", fp_bytes);
+            free(rng_energy_array);
+            free(rng_phase_array);
+            free(rng_spin_array);
+            free(field_map_tmp);
+            return 0;
+        }
+        for (int i = 0; i < cells; ++i) {
+            rng_energy_array[i] = energy_rng;
+            rng_phase_array[i] = phase_rng;
+            rng_spin_array[i] = spin_rng;
+        }
+        free_rng_arrays = 1;
+    } else {
+        rng_energy_array = &energy_rng;
+        rng_phase_array = &phase_rng;
+        rng_spin_array = &spin_rng;
+    }
+
+    float* energy_array = NULL;
+    float* phase_array = NULL;
+    float* interference_array = NULL;
+    int* node_array = NULL;
+    int* spin_array = NULL;
+    int* topo_array = NULL;
+    int free_output_arrays = (cells > 1);
+
+    if (cells > 1) {
+        if (out_energy) {
+            energy_array = (float*)malloc(sizeof(float) * (size_t)cells);
+            if (!energy_array) { fprintf(stderr, "[C] subqg_simulation_step: Failed to allocate energy array.\n"); goto cleanup_fail; }
+        }
+        if (out_phase) {
+            phase_array = (float*)malloc(sizeof(float) * (size_t)cells);
+            if (!phase_array) { fprintf(stderr, "[C] subqg_simulation_step: Failed to allocate phase array.\n"); goto cleanup_fail; }
+        }
+        if (out_interference) {
+            interference_array = (float*)malloc(sizeof(float) * (size_t)cells);
+            if (!interference_array) { fprintf(stderr, "[C] subqg_simulation_step: Failed to allocate interference array.\n"); goto cleanup_fail; }
+        }
+        if (out_node_flag) {
+            node_array = (int*)malloc(sizeof(int) * (size_t)cells);
+            if (!node_array) { fprintf(stderr, "[C] subqg_simulation_step: Failed to allocate node array.\n"); goto cleanup_fail; }
+        }
+        if (out_spin) {
+            spin_array = (int*)malloc(sizeof(int) * (size_t)cells);
+            if (!spin_array) { fprintf(stderr, "[C] subqg_simulation_step: Failed to allocate spin array.\n"); goto cleanup_fail; }
+        }
+        if (out_topology) {
+            topo_array = (int*)malloc(sizeof(int) * (size_t)cells);
+            if (!topo_array) { fprintf(stderr, "[C] subqg_simulation_step: Failed to allocate topology array.\n"); goto cleanup_fail; }
+        }
+    } else {
+        energy_array = out_energy ? &energy_tmp : NULL;
+        phase_array = out_phase ? &phase_tmp : NULL;
+        interference_array = out_interference ? &interference_tmp : NULL;
+        node_array = out_node_flag ? &node_tmp : NULL;
+        spin_array = out_spin ? &spin_tmp : NULL;
+        topo_array = out_topology ? &topo_tmp : NULL;
+    }
+
     int ok = subqg_simulation_step_batched(gpu_index,
-                                           &energy_rng, &phase_rng, &spin_rng,
-                                           1,
-                                           out_energy ? &energy_tmp : NULL,
-                                           out_phase ? &phase_tmp : NULL,
-                                           out_interference ? &interference_tmp : NULL,
-                                           out_node_flag ? &node_tmp : NULL,
-                                           out_spin ? &spin_tmp : NULL,
-                                           out_topology ? &topo_tmp : NULL,
+                                           rng_energy_array, rng_phase_array, rng_spin_array,
+                                           cells,
+                                           energy_array,
+                                           phase_array,
+                                           interference_array,
+                                           node_array,
+                                           spin_array,
+                                           topo_array,
                                            field_map_tmp, field_map_length);
 
     if (ok) {
-        if (out_energy) { *out_energy = energy_tmp; }
-        if (out_phase) { *out_phase = phase_tmp; }
-        if (out_interference) { *out_interference = interference_tmp; }
-        if (out_node_flag) { *out_node_flag = node_tmp; }
-        if (out_spin) { *out_spin = spin_tmp; }
-        if (out_topology) { *out_topology = topo_tmp; }
+        if (out_energy) {
+            if (cells == 1) {
+                *out_energy = energy_tmp;
+            } else {
+                double accum = 0.0;
+                for (int i = 0; i < cells; ++i) { accum += energy_array[i]; }
+                *out_energy = (float)(accum / (double)cells);
+            }
+        }
+        if (out_phase) {
+            if (cells == 1) {
+                *out_phase = phase_tmp;
+            } else {
+                double accum = 0.0;
+                for (int i = 0; i < cells; ++i) { accum += phase_array[i]; }
+                *out_phase = (float)(accum / (double)cells);
+            }
+        }
+        if (out_interference) {
+            if (cells == 1) {
+                *out_interference = interference_tmp;
+            } else {
+                double accum = 0.0;
+                for (int i = 0; i < cells; ++i) { accum += interference_array[i]; }
+                *out_interference = (float)(accum / (double)cells);
+            }
+        }
+        if (out_node_flag) {
+            *out_node_flag = (cells == 1) ? node_tmp : node_array[0];
+        }
+        if (out_spin) {
+            *out_spin = (cells == 1) ? spin_tmp : spin_array[0];
+        }
+        if (out_topology) {
+            *out_topology = (cells == 1) ? topo_tmp : topo_array[0];
+        }
         if (out_field_map && field_map_tmp) {
             memcpy(out_field_map, field_map_tmp, sizeof(float) * (size_t)field_map_length);
         }
+    }
+
+    if (free_output_arrays) {
+        free(energy_array);
+        free(phase_array);
+        free(interference_array);
+        free(node_array);
+        free(spin_array);
+        free(topo_array);
+    }
+
+    if (free_rng_arrays) {
+        free(rng_energy_array);
+        free(rng_phase_array);
+        free(rng_spin_array);
     }
 
     if (field_map_tmp) {
@@ -3207,6 +3325,23 @@ DLLEXPORT int subqg_simulation_step(int gpu_index, float rng_energy, float rng_p
     }
 
     return ok;
+
+cleanup_fail:
+    if (energy_array && free_output_arrays) { free(energy_array); }
+    if (phase_array && free_output_arrays) { free(phase_array); }
+    if (interference_array && free_output_arrays) { free(interference_array); }
+    if (node_array && free_output_arrays) { free(node_array); }
+    if (spin_array && free_output_arrays) { free(spin_array); }
+    if (topo_array && free_output_arrays) { free(topo_array); }
+    if (free_rng_arrays) {
+        free(rng_energy_array);
+        free(rng_phase_array);
+        free(rng_spin_array);
+    }
+    if (field_map_tmp) {
+        free(field_map_tmp);
+    }
+    return 0;
 }
 
 DLLEXPORT int subqg_simulation_step_batched(int gpu_index,
