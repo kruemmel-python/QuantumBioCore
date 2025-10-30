@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import time
 from ctypes import byref, c_char_p, c_int, c_size_t, c_void_p
 from dataclasses import dataclass
@@ -23,6 +24,9 @@ from dll_wrapper import (
     QuantumGate,
     core,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class QBCError(RuntimeError):
@@ -164,6 +168,7 @@ class CipherCoreGPU:
     def __init__(self, gpu_index: int):
         self.gpu_index: int = int(gpu_index)
         self._alive: bool = False
+        self._last_gate_sequence: list[QuantumGate] = []
         status = core.initialize_gpu(c_int(self.gpu_index))
         if status == 0:
             raise QBCError(f"initialize_gpu({self.gpu_index}) fehlgeschlagen")
@@ -246,6 +251,7 @@ class CipherCoreGPU:
             core.finish_gpu(c_int(self.gpu_index))
         core.shutdown_gpu(c_int(self.gpu_index))
         self._alive = False
+        self._last_gate_sequence.clear()
 
     # Mathematische Bausteine --------------------------------------------
     def matmul(self, A: np.ndarray, B: np.ndarray) -> np.ndarray:
@@ -568,21 +574,113 @@ class CipherCoreGPU:
             core.quantum_upload_gate_sequence(c_int(self.gpu_index), arr, c_int(len(seq))),
             "quantum_upload_gate_sequence",
         )
+        self._last_gate_sequence = [self._clone_gate(gate) for gate in seq]
 
     def quantum_apply_gate_sequence(self, num_qubits: int) -> np.ndarray:
         if num_qubits <= 0:
             raise ValueError("num_qubits muss > 0 sein")
         probs = np.empty((1 << num_qubits,), dtype=np.float32)
-        self._check(
-            core.quantum_apply_gate_sequence(
+        try:
+            status = core.quantum_apply_gate_sequence(
                 c_int(self.gpu_index),
                 c_int(num_qubits),
                 probs.ctypes.data_as(FloatPtr),
                 c_int(probs.size),
-            ),
-            "quantum_apply_gate_sequence",
-        )
+            )
+        except OSError as exc:
+            logger.warning(
+                "quantum_apply_gate_sequence crashed in GPU driver path – using CPU fallback: %s",
+                exc,
+            )
+            return self._simulate_gate_sequence_cpu(num_qubits)
+        if status == 0:
+            if self._last_gate_sequence:
+                logger.warning(
+                    "quantum_apply_gate_sequence returned error code – using CPU fallback.",
+                )
+                return self._simulate_gate_sequence_cpu(num_qubits)
+            self._check(status, "quantum_apply_gate_sequence")
         return probs
+
+    @staticmethod
+    def _clone_gate(gate: QuantumGate) -> QuantumGate:
+        return QuantumGate.from_buffer_copy(bytes(gate))
+
+    @staticmethod
+    def _compose_index(base: int, qubits: list[int], local_index: int) -> int:
+        idx = base
+        for bit, qubit in enumerate(qubits):
+            if (local_index >> bit) & 1:
+                idx |= 1 << qubit
+        return idx
+
+    def _gate_qubits(self, gate: QuantumGate, arity: int) -> list[int]:
+        if arity == 1:
+            return [int(gate.target)]
+        if arity == 2:
+            return [int(gate.control), int(gate.target)]
+        if arity == 3:
+            return [int(gate.control), int(gate.control2), int(gate.target)]
+        raise QBCError(f"Unsupported gate arity: {arity}")
+
+    def _extract_gate_matrix(self, gate: QuantumGate, size: int) -> np.ndarray:
+        mat = np.zeros((size, size), dtype=np.complex64)
+        for row in range(size):
+            for col in range(size):
+                entry = gate.matrix[row][col]
+                mat[row, col] = complex(entry.x, entry.y)
+        return mat
+
+    def _validate_qubits(self, qubits: list[int], num_qubits: int) -> None:
+        if len(set(qubits)) != len(qubits):
+            raise QBCError(f"Gate referenziert doppelte Qubit-Indizes: {qubits}")
+        for qubit in qubits:
+            if qubit < 0 or qubit >= num_qubits:
+                raise QBCError(
+                    f"Gate nutzt ungültigen Qubit-Index {qubit} bei {num_qubits} Qubits"
+                )
+
+    def _apply_gate_cpu(self, state: np.ndarray, gate: QuantumGate, num_qubits: int) -> None:
+        arity = int(gate.arity)
+        if arity <= 0 or arity > 3:
+            raise QBCError(f"Unsupported gate arity: {arity}")
+        qubits = self._gate_qubits(gate, arity)
+        self._validate_qubits(qubits, num_qubits)
+        mask = 0
+        for qubit in qubits:
+            mask |= 1 << qubit
+        subspace = 1 << arity
+        matrix = self._extract_gate_matrix(gate, subspace)
+        dimension = state.shape[0]
+        for base in range(dimension):
+            if base & mask:
+                continue
+            indices = [self._compose_index(base, qubits, local) for local in range(subspace)]
+            vec = state[indices].copy()
+            state[indices] = (matrix @ vec).astype(np.complex64, copy=False)
+
+    def _simulate_gate_sequence_cpu(self, num_qubits: int) -> np.ndarray:
+        if not self._last_gate_sequence:
+            raise QBCError("Keine Gate-Sequenz verfügbar – CPU-Fallback nicht möglich")
+        required_qubits = 0
+        for gate in self._last_gate_sequence:
+            arity = int(gate.arity)
+            if arity <= 0:
+                continue
+            qubits = self._gate_qubits(gate, arity)
+            if qubits:
+                required_qubits = max(required_qubits, max(qubits) + 1)
+        if required_qubits > num_qubits:
+            raise QBCError(
+                f"Gate-Sequenz benötigt mindestens {required_qubits} Qubits, aber {num_qubits} wurden angefragt"
+            )
+        dimension = 1 << num_qubits
+        state = np.zeros(dimension, dtype=np.complex64)
+        state[0] = 1.0 + 0.0j
+        for gate in self._last_gate_sequence:
+            self._apply_gate_cpu(state, gate, num_qubits)
+        probabilities = np.abs(state) ** 2
+        return probabilities.astype(np.float32, copy=False)
 
     def quantum_export_to_qasm(self, path: str) -> None:
         if not path:
