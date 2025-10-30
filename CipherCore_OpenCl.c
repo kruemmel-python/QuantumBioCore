@@ -3217,6 +3217,7 @@ DLLEXPORT int subqg_simulation_step(int gpu_index, float rng_energy, float rng_p
     int* spin_array = NULL;
     int* topo_array = NULL;
     int free_output_arrays = (cells > 1);
+    int ok = 0;
 
     if (cells > 1) {
         if (out_energy) {
@@ -3252,16 +3253,16 @@ DLLEXPORT int subqg_simulation_step(int gpu_index, float rng_energy, float rng_p
         topo_array = out_topology ? &topo_tmp : NULL;
     }
 
-    int ok = subqg_simulation_step_batched(gpu_index,
-                                           rng_energy_array, rng_phase_array, rng_spin_array,
-                                           cells,
-                                           energy_array,
-                                           phase_array,
-                                           interference_array,
-                                           node_array,
-                                           spin_array,
-                                           topo_array,
-                                           field_map_tmp, field_map_length);
+    ok = subqg_simulation_step_batched(gpu_index,
+                                       rng_energy_array, rng_phase_array, rng_spin_array,
+                                       cells,
+                                       energy_array,
+                                       phase_array,
+                                       interference_array,
+                                       node_array,
+                                       spin_array,
+                                       topo_array,
+                                       field_map_tmp, field_map_length);
 
     if (ok) {
         if (out_energy) {
