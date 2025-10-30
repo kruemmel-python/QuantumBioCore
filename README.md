@@ -1,236 +1,146 @@
-# ⚛️ CipherCore OpenCL – Hybrid Quantum GPU Compute Engine
+# ⚛️ CipherCore OpenCL – Installations- und Schnellstart-Anleitung
 
-**Autor:** Ralf Krümmel – Lead Architect for Synthetic Consciousness Systems  
-**Version:** 0.9b (SubQG/Quantum Edition)  
-**Lizenz:** Open Research License (ORL)  
-**Stand:** Oktober 2025  
+Diese README führt dich Schritt für Schritt von der Installation der Abhängigkeiten über die Kompilierung des OpenCL-Treibers bis zum Einsatz des Python-Wrappers und der Streamlit-Visualisierung.
 
 ---
 
-## 🧬 Übersicht
+## 1. Voraussetzungen
 
-**CipherCore_OpenCL.dll** ist ein universeller OpenCL-Treiber zur Ausführung von
-biologisch inspirierten, neuronalen und quantenmechanischen Algorithmen
-auf klassischer GPU-Hardware (AMD, NVIDIA, Intel, Apple).
+| Komponente | Empfehlung |
+| ---------- | ---------- |
+| Betriebssystem | Linux (Ubuntu 22.04+), Windows 11 oder macOS 13+ |
+| Compiler | `g++` oder `clang` mit C++17-Unterstützung |
+| GPU & Treiber | OpenCL 1.2+ (AMD/NVIDIA/Intel/Apple) |
+| Python | 3.10 oder neuer |
 
-Das Projekt stellt eine Brücke zwischen *BioCortex*, *HPIO* und *SubQG* dar –
-eine Symbiose aus Denken, Energiefluss und Emergenz.
-Es verbindet deterministische neuronale Prozesse mit probabilistischer Quantenlogik
-innerhalb einer einzigen Hardware-beschleunigten Laufzeitumgebung.
+### OpenCL SDK installieren
 
-> 💡 *Ziel:* Eine vollständig lokale, CUDA-freie Plattform für Quantum-Inspired-Computing
-> und experimentelle Emergenz-Simulationen auf handelsüblichen GPUs.
+* **Linux (Ubuntu/Pop!_OS):**
+  ```bash
+  sudo apt install build-essential ocl-icd-opencl-dev opencl-headers
+  ```
+* **Windows:** Installiere das entsprechende GPU-SDK (AMD APP SDK, Intel OpenCL, NVIDIA CUDA Toolkit mit OpenCL-Komponenten) und setze `OPENCL_SDK` in den Umgebungsvariablen.
+* **macOS:** OpenCL ist Teil von Xcode Command Line Tools. Führe `xcode-select --install` aus.
 
----
-
-## ⚙️ Architektur
-
-```
-
-┌──────────────────────────────┐
-│ CipherCore_OpenCL.dll        │
-│ ──────────────────────────── │
-│  • GPU-Driver Layer (OpenCL) │
-│  • Math / NN / Quantum Kernels│
-│  • SubQG Simulation Core      │
-└─────────────┬────────────────┘
-│
-Python / C# / Rust
-│
-┌──────────────┐
-│ python_app.cli│
-│ BioCortex, HPIO│
-└──────────────┘
-
-````
-
-### Hauptkomponenten
-
-| Modul | Beschreibung |
-|--------|---------------|
-| **Core Layer** | Initialisierung, Speicherverwaltung, Kernel-Kompilierung, GPU-Shutdown |
-| **Math Kernels** | Matrix-Multiplikation, LayerNorm, Adam, Softmax, GELU, Transpose |
-| **Bio-Kernels** | Hebb-Learning, Proto-Segmentierung, STDP-Mechanismen |
-| **Loss/Reward** | Form-Shaping, Penalty-Adaption, Reward-Propagation |
-| **SubQG-Core** | Simulation subquanter Felder, Energie-/Phasen-Interferenz, Node-Emergenz |
-| **Quantum Layer** | GPU-Simulation echter Qubit-Operationen und Register |
-| **Algorithmic Layer** | Shor, Grover, QAOA, VQE, HHL, QEC, Quantum-Classifier |
-
----
-
-## 🧠 SubQG-Simulation (Sub-Quantum-Grid)
-
-Das SubQG-Modul bildet den energetischen Unterbau des Systems:
-Es simuliert subquantenmechanische Wechselwirkungen in einem diskreten Feldgitter.
-Hier entstehen *Nodes* als emergente Strukturen, sobald Energie- und Phasenflüsse
-eine kritische Schwelle überschreiten.
-
-**Kernfunktionen:**
-- `subqg_initialize_state()`
-- `subqg_simulation_step()`
-- `subqg_simulation_step_batched()`
-
-**Effekte:**
-- Quantenähnliche Interferenz und Rauschausbreitung  
-- Emergenz kritischer Punkte („Nodes“)  
-- Phasenübergänge zwischen deterministischer und chaotischer Dynamik  
-
----
-
-## ⚛️ Quantenmodul
-
-CipherCore enthält eine komplette GPU-basierte Quanten-Simulationsschicht:
-
-### Quantum Register Operations
-```c
-quantum_apply_hadamard();
-quantum_apply_controlled_not();
-quantum_expectation_pauli_z_gpu();
-````
-
-### High-Level Quantenalgorithmen
-
-| Algorithmus        | Beschreibung                                      | Anwendung                    |
-| ------------------ | ------------------------------------------------- | ---------------------------- |
-| **Shor**           | Faktorisierung durch periodische Modulation + QFT | Kryptanalyse                 |
-| **Grover**         | Zustands-Suche über Amplitudenverstärkung         | Datenbank-Suche              |
-| **VQE**            | Variational Quantum Eigensolver                   | Molekulare Energieminima     |
-| **QAOA**           | Quantum Approximate Optimization                  | Graph-Optimierung            |
-| **HHL**            | Quantum Linear System Solver                      | Mathematische Simulation     |
-| **QML-Classifier** | Quantum Machine Learning Layer                    | Mustererkennung              |
-| **QEC**            | Quantum Error Correction                          | Stabilisierung von Zuständen |
-
-Jeder Algorithmus wird vollständig über OpenCL-Kernels berechnet.
-Die Zustände (Superpositionen) liegen als `cl_float2` im GPU-Speicher (VRAM).
-
----
-
-## 🧮 Mathematische Optimierungen
-
-* Nutzung von **`native_exp`, `native_log`, `native_erf`** für GPU-native Pfade
-* Duale Kompilierung:
-
-  * *Strict Precision Mode*
-  * *Fast-Math Mode*
-* Laufzeitprüfung auf:
-
-  * Atomics-Support
-  * FP64-Verfügbarkeit
-  * Erweiterung `cl_khr_global_int32_base_atomics`
-* Adaptive Kernel-Kompilierung via `compile_opencl_kernel_dual()`
-
----
-
-## 🧩 Integration in Python
-
-CipherCore kann direkt über **`ctypes`** oder **`cffi`** geladen werden.
-
-Beispiel:
-
-```python
-from ctypes import CDLL, c_int, c_float
-
-core = CDLL("CipherCore_OpenCL.dll")
-core.initialize_gpu(c_int(0))
-core.subqg_simulation_step(c_int(100), c_float(0.68), c_float(0.8))
-core.shutdown_gpu()
-```
-
-### CLI-Beispiel (Python)
+### Python-Abhängigkeiten
 
 ```bash
-python -m python_app.cli 100 0.68 0.8 quantum --seed 42 --segment-duration 5 --output run_th0.68_n0.80.json
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+pip install -r requirements.txt  # enthält streamlit, numpy usw.
+```
+
+> Falls keine `requirements.txt` vorhanden ist, installiere mindestens `streamlit`, `numpy`, `matplotlib` und `pyopencl`.
+
+---
+
+## 2. Kompilierung des Treibers
+
+### Verzeichnis vorbereiten
+
+```bash
+cd QuantumBioCore
+mkdir -p build
+```
+
+### Beispiel: Kompilieren unter Linux / MinGW
+
+```bash
+g++ -std=c++17 -O3 -march=native -ffast-math -funroll-loops -fstrict-aliasing \
+    -DNDEBUG -DCL_TARGET_OPENCL_VERSION=120 -DCL_FAST_OPTS \
+    -shared CipherCore_OpenCl.c -o build/CipherCore_OpenCl.dll \
+    -I"./CL" -L"./CL" -lOpenCL "-Wl,--out-implib,build/libCipherCore_OpenCl.a"
+```
+
+**Hinweise:**
+
+* Passe `-I` und `-L` an den Pfad deiner OpenCL-SDK-Installation an.
+* Unter Linux kann die Ausgabedatei z. B. `libCipherCore_OpenCl.so` heißen.
+* Auf Windows empfiehlt sich die Verwendung von MSYS2/MinGW oder MSVC (`cl.exe`).
+
+### Verifizierung
+
+```bash
+ls build/
+# Erwartet: CipherCore_OpenCl.dll (oder .so) sowie libCipherCore_OpenCl.a
 ```
 
 ---
 
-## 📊 Experimentelle Ergebnisse (GPU-Test 2025-10-29)
+## 3. Nutzung des Python-Wrappers
 
-| Parameter            | Beschreibung                   |
-| -------------------- | ------------------------------ |
-| **GPU**              | AMD Radeon gfx90c              |
-| **OpenCL**           | 2.2 – FP64 + Atomics aktiviert |
-| **Temperatur**       | 48–52 °C stabil                |
-| **GPU-Load**         | 1–3 % (Compute)                |
-| **Host-CPU**         | Ryzen 7 5800H                  |
-| **Simulationsdauer** | 100 Ticks × 5 Segmente         |
-| **RNG-Typ**          | `quantum` (stochastisch)       |
+### Wrapper konfigurieren
 
-### Auswertung der Node-Emergenz
+* Stelle sicher, dass die kompilierten Artefakte (`CipherCore_OpenCl.dll`/`.so` und ggf. `libCipherCore_OpenCl.a`) im selben Ordner wie `dll_wrapper.py` liegen **oder** dass der Pfad über `LD_LIBRARY_PATH`/`PATH` eingebunden ist.
 
-| threshold | noise | total_nodes |
-| --------: | ----: | ----------: |
-|      0.68 |  0.80 |      **81** |
-|      0.72 |  0.88 |          70 |
-|      0.72 |  0.80 |          41 |
-|      0.70 |  0.88 |          39 |
-|      0.64 |  0.92 |          36 |
-|      0.68 |  0.90 |          31 |
-|      0.66 |  0.80 |          30 |
+### Funktionsprüfung
 
-→ **Emergenz** tritt oberhalb *noise ≈ 0.8* und *threshold ≈ 0.68 – 0.72* auf.
-Dies markiert eine Phase-Transition zwischen Ordnung und Chaos –
-die sogenannte *Edge of Quantum Stability*.
+```bash
+python dll_wrapper.py --list-devices
+```
 
----
+Typische Ausgabe: Liste der erkannten OpenCL-Devices sowie ein kurzer Selbsttest, der SubQG-, Noise-Control- und Quantum-Gate-Funktionen initialisiert.
 
-## 🔬 Vergleich zu „IBM Quantum on AMD“
+### Minimalbeispiel in Python
 
-| Aspekt             | IBM Quantum on AMD | CipherCore OpenCL                  |
-| ------------------ | ------------------ | ---------------------------------- |
-| Quanten-Simulation | Tensor-Netzwerke   | Direkte OpenCL-Gates               |
-| Plattform          | ROCm exklusiv      | Cross-Vendor OpenCL                |
-| Architektur        | Geschlossene Cloud | Lokale DLL                         |
-| Zielgruppe         | HPC-Cluster        | Forschung & KI-Integration         |
-| Integration        | Isoliert           | Teil des BioCortex/HPIO-Ökosystems |
+```python
+from dll_wrapper import CipherCore
 
-**Ergebnis:**
-CipherCore demonstriert bereits heute das, was IBM für 2026 ankündigt –
-Quanten-inspirierte GPU-Berechnungen auf Standard-AMD-Hardware.
+core = CipherCore(device_index=0)
+core.initialize()
+
+state = core.subqg_step(alpha=0.7, beta=0.8, gamma=0.9, visualize=False)
+print("SubQG result:", state.energy.mean())
+
+core.shutdown()
+```
 
 ---
 
-## 🚀 Leistungsmerkmale
+## 4. Streamlit-App starten
 
-* ✅ CUDA-freie Quanten-Simulation
-* ✅ Biologisch-inspiriertes Energiemodell (SubQG)
-* ✅ Dynamische Kernel-Kompilierung
-* ✅ Vollständiger Python-/C#-/Rust-Zugriff
-* ✅ GPU-beschleunigte Hebb- und Spiking-Netze
-* ✅ Implementierte Quantenalgorithmen (Shor, Grover, VQE, QAOA, HHL, QEC)
+Die Streamlit-Oberfläche visualisiert Noise-Control, SubQG-Felder, HPIO-Agenten und Quantum-Gate-Sequenzen in Echtzeit.
 
----
+### Start
 
-## 🧩 Weiterentwicklung
+```bash
+streamlit run streamlit_app.py
+```
 
-| Ziel                        | Beschreibung                                          |
-| --------------------------- | ----------------------------------------------------- |
-| **Auto-Noise Control**      | Feedback-basierte Anpassung des Rauschpegels          |
-| **Quantum-Gate-Library**    | Erweiterung um U3, CRZ, SWAP, Toffoli                 |
-| **Real-Time Visualization** | OpenGL-Rendering der SubQG-Felder                     |
-| **Qiskit-Vergleich**        | Validierung gegen reale Q-Hardware                    |
-| **BioCortex-Symbiose**      | Koppelung mit HPIO-Feldagenten zur Selbstorganisation |
+Öffne anschließend den angezeigten lokalen Link (standardmäßig `http://localhost:8501`).
 
----
+### Wichtige Panels
 
-## 📘 Fazit
+1. **Device Dashboard** – Auswahl des OpenCL-Geräts, Live-Profiling der Kernel-Laufzeiten.
+2. **Noise Feedback Visualization** – Echtzeitregelung über `set_noise_level()` und Variance-Metriken.
+3. **SubQG Field Map** – Visualisierung von Energie/Phase, optional mit HPIO-Agenteninjektion.
+4. **Quantum Gate Sequencer** – Zusammenstellung von U3-, CRZ-, SWAP- und Toffoli-Gattern, Export zu QASM.
 
-> *CipherCore_OpenCL.dll* ist mehr als eine GPU-Bibliothek –
-> sie ist ein **universeller Hybrid-Compute-Kern**,
-> der neuronale, biologische und quantenmechanische Prinzipien vereint.
-
-Damit wird erstmals demonstriert, dass:
-
-* Quantenähnliche Emergenzprozesse **auf klassischer Hardware** simuliert werden können,
-* AMD-GPUs **vollwertige Quanten-Operatoren** ausführen können,
-* und OpenCL als **offene Alternative zu proprietären Quantum-Stacks** taugt.
+> Tipp: Aktiviere in der App den Profiling-Stream, um Kernel-Laufzeiten für Auto-Tuning zu analysieren.
 
 ---
 
-**„Bewusstsein entsteht dort,
-wo Energie Information formt –
-und Information zurückfließt in Energie.“**
+## 5. Häufige Fehler & Troubleshooting
 
-– *Ralf Krümmel, 2025*
+| Problem | Ursache | Lösung |
+| ------- | ------- | ------ |
+| `clGetPlatformIDs` schlägt fehl | Kein OpenCL-Treiber installiert | GPU-Treiber/SDK installieren und Rechner neu starten |
+| DLL wird nicht gefunden | Pfad nicht im Suchpfad | `export LD_LIBRARY_PATH=$PWD/build:$LD_LIBRARY_PATH` bzw. `set PATH=%CD%\build;%PATH%` |
+| Streamlit zeigt leere Panels | Wrapper konnte nicht initialisieren | Terminal-Log prüfen, Treiber neu kompilieren, Device-ID wechseln |
+| Python meldet `OSError: cannot load library` | Architektur-Mismatch (32/64 Bit) | Compiler- und Python-Architektur abgleichen |
+
+---
+
+## 6. Weiterführende Ressourcen
+
+* `CipherCore_OpenCl.c` – Haupttreiber mit Kerneln, Noise-Control-Hooks, Quantum-Gate-Buffer.
+* `CipherCore_NoiseCtrl.c/.h` – Adaptive Noise Engine.
+* `SymBio_Interface.h` – HPIO-Agentenstruktur für BioCortex-Symbiose.
+* `dll_wrapper.py` – ctypes-Anbindung inkl. Export- und Visualisierungs-API.
+* `streamlit_app.py` – Frontend für Visualisierung und Steuerung.
+
+---
+
+Viel Erfolg beim Experimentieren mit der adaptiven Quantum-Bio-Compute-Engine!
 
 
