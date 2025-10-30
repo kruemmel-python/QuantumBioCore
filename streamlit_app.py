@@ -6,15 +6,113 @@
 from __future__ import annotations
 
 import contextlib
+import math
 import time
 from ctypes import byref, c_int, c_size_t, c_void_p
 from dataclasses import dataclass
-from typing import Any, Final, Iterable
+from collections.abc import Iterable, Mapping, Sequence
+from typing import Any, Final
 
 import numpy as np
 import streamlit as st
 
 from dll_wrapper import FLOAT_C_TYPE, UInt64, core
+
+
+_H_MATRIX = np.array([[1, 1], [1, -1]], dtype=np.complex64) / math.sqrt(2)
+_X_MATRIX = np.array([[0, 1], [1, 0]], dtype=np.complex64)
+_Y_MATRIX = np.array([[0, -1j], [1j, 0]], dtype=np.complex64)
+_Z_MATRIX = np.array([[1, 0], [0, -1]], dtype=np.complex64)
+
+
+def _rotation_matrix(axis: str, theta: float) -> np.ndarray:
+    """Return a complex rotation matrix for the given axis."""
+
+    half = theta / 2.0
+    c = math.cos(half)
+    s = math.sin(half)
+    if axis == "X":
+        return np.array([[c, -1j * s], [-1j * s, c]], dtype=np.complex64)
+    if axis == "Y":
+        return np.array([[c, -s], [s, c]], dtype=np.complex64)
+    if axis == "Z":
+        exp_pos = complex(math.cos(half), math.sin(half))
+        exp_neg = complex(math.cos(half), -math.sin(half))
+        return np.array([[exp_neg, 0], [0, exp_pos]], dtype=np.complex64)
+    raise ValueError(f"Unbekannte Rotationsachse '{axis}'")
+
+
+def _apply_single_qubit_gate(
+    state: np.ndarray, matrix: np.ndarray, target: int
+) -> None:
+    """Apply a 2x2 matrix to the target qubit in-place."""
+
+    dim = state.shape[0]
+    mask = 1 << target
+    for basis_index in range(dim):
+        if basis_index & mask:
+            continue  # handle when target bit is 0 to avoid double processing
+        partner = basis_index | mask
+        amp0 = state[basis_index]
+        amp1 = state[partner]
+        state[basis_index] = matrix[0, 0] * amp0 + matrix[0, 1] * amp1
+        state[partner] = matrix[1, 0] * amp0 + matrix[1, 1] * amp1
+
+
+def _apply_controlled_gate(
+    state: np.ndarray, matrix: np.ndarray, control: int, target: int
+) -> None:
+    """Apply a controlled single-qubit gate in-place."""
+
+    if control == target:
+        raise ValueError("control und target dürfen nicht identisch sein")
+    dim = state.shape[0]
+    control_mask = 1 << control
+    target_mask = 1 << target
+    for basis_index in range(dim):
+        if not (basis_index & control_mask):
+            continue
+        if basis_index & target_mask:
+            continue
+        partner = basis_index | target_mask
+        amp0 = state[basis_index]
+        amp1 = state[partner]
+        state[basis_index] = matrix[0, 0] * amp0 + matrix[0, 1] * amp1
+        state[partner] = matrix[1, 0] * amp0 + matrix[1, 1] * amp1
+
+
+def _apply_controlled_phase(
+    state: np.ndarray, control: int, target: int, phase: float
+) -> None:
+    """Apply a controlled phase (diagonal) gate in-place."""
+
+    if control == target:
+        raise ValueError("control und target dürfen nicht identisch sein")
+    dim = state.shape[0]
+    control_mask = 1 << control
+    target_mask = 1 << target
+    phase_factor = complex(math.cos(phase), math.sin(phase))
+    for basis_index in range(dim):
+        if (basis_index & control_mask) and (basis_index & target_mask):
+            state[basis_index] *= phase_factor
+
+
+def _apply_swap(state: np.ndarray, a: int, b: int) -> None:
+    """Swap two qubits in-place."""
+
+    if a == b:
+        return
+    dim = state.shape[0]
+    mask_a = 1 << a
+    mask_b = 1 << b
+    for basis_index in range(dim):
+        bit_a = basis_index & mask_a
+        bit_b = basis_index & mask_b
+        if (bit_a == 0) == (bit_b == 0):
+            continue
+        partner = basis_index ^ (mask_a | mask_b)
+        if basis_index < partner:
+            state[basis_index], state[partner] = state[partner], state[basis_index]
 
 
 class QBCError(RuntimeError):
@@ -33,6 +131,8 @@ class CipherCoreGPU:
     def __init__(self, gpu_index: int):
         self.gpu_index: int = int(gpu_index)
         self._alive: bool = False
+        self._quantum_gate_sequence: list[Any] = []
+        self._last_quantum_state: np.ndarray | None = None
         status = core.initialize_gpu(c_int(self.gpu_index))
         if status == 0:
             raise QBCError(f"initialize_gpu({self.gpu_index}) fehlgeschlagen")
@@ -340,6 +440,161 @@ class CipherCoreGPU:
             func(*args)
         end = time.perf_counter()
         return (end - start) / max(1, iters)
+
+    # Quantum --------------------------------------------------------------
+    def set_quantum_gate_sequence(self, sequence: Iterable[Any]) -> None:
+        """Persistiert eine Gate-Sequenz für spätere Simulationen."""
+
+        self._quantum_gate_sequence = list(sequence)
+
+    def quantum_apply_gate_sequence(
+        self,
+        num_qubits: int,
+        sequence: Iterable[Any] | None = None,
+    ) -> np.ndarray:
+        """Simuliert eine Gate-Sequenz CPU-seitig und liefert Messwahrscheinlichkeiten."""
+
+        nq = int(num_qubits)
+        if nq <= 0:
+            raise ValueError("num_qubits muss > 0 sein")
+
+        gates = (
+            list(sequence)
+            if sequence is not None
+            else list(getattr(self, "_quantum_gate_sequence", []))
+        )
+
+        dim = 1 << nq
+        state = np.zeros(dim, dtype=np.complex64)
+        state[0] = 1.0 + 0.0j
+
+        def _as_list(value: Any) -> list[int]:
+            if value is None:
+                return []
+            if isinstance(value, (list, tuple)):
+                return [int(v) for v in value]
+            return [int(value)]
+
+        for idx, gate_desc in enumerate(gates):
+            gate_name: str
+            targets: list[int]
+            controls: list[int] = []
+            theta: float | None = None
+
+            if isinstance(gate_desc, Mapping):
+                raw_name = gate_desc.get("gate") or gate_desc.get("type") or gate_desc.get("name")
+                if raw_name is None:
+                    raise ValueError(f"Gate #{idx}: fehlender Name")
+                gate_name = str(raw_name).strip().upper()
+                if "targets" in gate_desc:
+                    targets = _as_list(gate_desc.get("targets"))
+                else:
+                    targets = _as_list(gate_desc.get("target"))
+                controls = _as_list(gate_desc.get("controls")) or _as_list(gate_desc.get("control"))
+                params = gate_desc.get("params") or gate_desc.get("parameters")
+                if isinstance(params, np.ndarray):
+                    if params.size:
+                        theta = float(np.asarray(params).reshape(-1)[0])
+                elif isinstance(params, Sequence) and not isinstance(params, (str, bytes)) and params:
+                    theta = float(params[0])
+                elif isinstance(params, (str, bytes)):
+                    theta = float(params)
+                elif params is not None and not isinstance(params, Sequence):
+                    theta = float(params)
+                if theta is None:
+                    val = (
+                        gate_desc.get("theta")
+                        or gate_desc.get("angle")
+                        or gate_desc.get("phase")
+                        or gate_desc.get("phi")
+                    )
+                    if val is not None:
+                        theta = float(val)
+            elif isinstance(gate_desc, (list, tuple)) and gate_desc:
+                gate_name = str(gate_desc[0]).strip().upper()
+                rest = list(gate_desc[1:])
+                targets = _as_list(rest[0]) if rest else []
+                if len(rest) >= 2:
+                    controls = _as_list(rest[1])
+                if len(rest) >= 3 and rest[2] is not None:
+                    theta = float(rest[2])
+            elif isinstance(gate_desc, str):
+                parts = [p for p in gate_desc.replace("(", " ").replace(")", " ").replace(",", " ").split() if p]
+                if not parts:
+                    continue
+                gate_name = parts[0].upper()
+                nums = [int(p) for p in parts[1:] if p.lstrip("-+").isdigit()]
+                targets = nums[:1]
+                controls = nums[1:]
+                theta = None
+            else:
+                raise ValueError(f"Gate #{idx}: unbekanntes Format {type(gate_desc)!r}")
+
+            if not targets:
+                raise ValueError(f"Gate '{gate_name}' benötigt mindestens ein target")
+            for q in targets + controls:
+                if q < 0 or q >= nq:
+                    raise ValueError(f"Gate '{gate_name}': Qubit {q} außerhalb des Registers (n={nq})")
+
+            target = targets[0]
+
+            if gate_name in {"H", "HADAMARD"}:
+                _apply_single_qubit_gate(state, _H_MATRIX, target)
+            elif gate_name in {"X", "PAULI-X", "NOT"}:
+                _apply_single_qubit_gate(state, _X_MATRIX, target)
+            elif gate_name in {"Y", "PAULI-Y"}:
+                _apply_single_qubit_gate(state, _Y_MATRIX, target)
+            elif gate_name in {"Z", "PAULI-Z"}:
+                _apply_single_qubit_gate(state, _Z_MATRIX, target)
+            elif gate_name in {"RX", "RY", "RZ"}:
+                if theta is None:
+                    raise ValueError(f"Gate '{gate_name}' benötigt einen Winkel")
+                matrix = _rotation_matrix(gate_name[-1], float(theta))
+                _apply_single_qubit_gate(state, matrix, target)
+            elif gate_name in {"PHASE", "P"}:
+                if theta is None:
+                    raise ValueError("PHASE Gate benötigt einen Winkel")
+                phase = complex(math.cos(theta), math.sin(theta))
+                mask = 1 << target
+                for basis_index in range(dim):
+                    if basis_index & mask:
+                        state[basis_index] *= phase
+            elif gate_name == "CPHASE":
+                if not controls:
+                    raise ValueError("CPHASE benötigt ein control")
+                if theta is None:
+                    raise ValueError("CPHASE benötigt einen Winkel")
+                _apply_controlled_phase(state, controls[0], target, float(theta))
+            elif gate_name == "CRZ":
+                if not controls:
+                    raise ValueError("CRZ benötigt ein control")
+                if theta is None:
+                    raise ValueError("CRZ benötigt einen Winkel")
+                _apply_controlled_phase(state, controls[0], target, float(theta))
+            elif gate_name in {"CNOT", "CX"}:
+                if not controls:
+                    raise ValueError("CNOT benötigt ein control")
+                _apply_controlled_gate(state, _X_MATRIX, controls[0], target)
+            elif gate_name in {"CY"}:
+                if not controls:
+                    raise ValueError("CY benötigt ein control")
+                _apply_controlled_gate(state, _Y_MATRIX, controls[0], target)
+            elif gate_name == "CZ":
+                if not controls:
+                    raise ValueError("CZ benötigt ein control")
+                _apply_controlled_phase(state, controls[0], target, math.pi)
+            elif gate_name in {"SWAP"}:
+                if len(targets) < 2:
+                    raise ValueError("SWAP benötigt zwei targets")
+                _apply_swap(state, targets[0], targets[1])
+            elif gate_name in {"ID", "I", "IDENTITY"}:
+                continue
+            else:
+                raise ValueError(f"Gate '{gate_name}' wird nicht unterstützt")
+
+        self._last_quantum_state = state.copy()
+        probabilities = np.abs(state) ** 2
+        return probabilities.astype(np.float32, copy=False)
 
 # ============================================================
 # 0) Hilfen: Stateful GPU-Instanz & Cleanup
