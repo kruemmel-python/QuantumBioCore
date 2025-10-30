@@ -278,6 +278,8 @@ if __name__ == "__main__":
             spin = (c_int * 1)()
             topology = (c_int * 1)()
 
+            field_map = (FLOAT_C_TYPE * 1)()
+
             step_status = core.subqg_simulation_step(
                 GPU_INDEX,
                 FLOAT_C_TYPE(0.1),
@@ -289,18 +291,21 @@ if __name__ == "__main__":
                 node_flag,
                 spin,
                 topology,
+                field_map,
+                1,
             )
             print(f"ℹ️  subqg_simulation_step Rückgabewert: {step_status}")
             if status_success(step_status):
                 print(
                     "✅ SubQG Schritt erfolgreich — Energie={:.6f}, Phase={:.6f}, Interferenz={:.6f}, "
-                    "NodeFlag={}, Spin={}, Topologie={}".format(
+                    "NodeFlag={}, Spin={}, Topologie={}, FieldMap={:.6f}".format(
                         energy[0],
                         phase[0],
                         interference[0],
                         node_flag[0],
                         spin[0],
                         topology[0],
+                        field_map[0],
                     )
                 )
             else:
