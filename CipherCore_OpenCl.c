@@ -27,6 +27,7 @@ bitte keine platzhalter wie weitere...! ALLE bitte. hier der code der dll!
 #include <math.h>
 #include <float.h> /* For FLT_MAX, HUGE_VALF */
 #include <stdint.h> // For uintptr_t
+#include <limits.h>
 
 // Include OpenCL headers based on the operating system
 #ifdef __APPLE__
@@ -2034,7 +2035,7 @@ const char *quantum_simulation_kernels_src =
 "    }\n"
 "}\n"
 "\n"
-"__kernel void quantum_phase_flip_except_zero(__global float2* state, const size_t dimension) {\n"
+"__kernel void quantum_phase_flip_except_zero(__global float2* state, const uint dimension) {\n"
 "    size_t idx = get_global_id(0);\n"
 "    if (idx >= dimension) return;\n"
 "    if (idx != 0) {\n"
@@ -4516,9 +4517,14 @@ static int quantum_apply_grover_oracle(QuantumStateGPU* state, uint64_t mask, ui
 static int quantum_apply_grover_diffusion(QuantumStateGPU* state) {
     if (!quantum_prepare_uniform_superposition(state, state->num_qubits, 0)) { return 0; }
     size_t dimension = state->dimension;
+    if (dimension > (size_t)UINT_MAX) {
+        fprintf(stderr, "[C] Quantum: Dimension %zu exceeds cl_uint range for phase-zero kernel.\n", dimension);
+        return 0;
+    }
+    cl_uint dimension_uint = (cl_uint)dimension;
     cl_int err = CL_SUCCESS;
     err |= clSetKernelArg(quantum_phase_zero_kernel, 0, sizeof(cl_mem), &state->buffer);
-    err |= clSetKernelArg(quantum_phase_zero_kernel, 1, sizeof(size_t), &dimension);
+    err |= clSetKernelArg(quantum_phase_zero_kernel, 1, sizeof(cl_uint), &dimension_uint);
     if (err != CL_SUCCESS) {
         fprintf(stderr, "[C] Quantum: Failed to set phase-zero args: %s (%d)\n", clGetErrorString(err), err);
         return 0;
